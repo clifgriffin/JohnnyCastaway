@@ -80,6 +80,14 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     /// 1.0 = faithful pacing; 2.0 doubles speed; 0.5 halves it.
     private var animationSpeed: Double = 1.0
 
+    /// Whether THIS instance persists story progress.  On multi-display
+    /// setups every display runs its own StoryRunner; if they all wrote
+    /// ProgressStoryDay the persisted day would be last-writer-wins and
+    /// could regress.  Only the main-display instance writes (same gate as
+    /// audio); the nil-main fallback keeps single-instance/test contexts
+    /// persisting.  Set during startupIfNeeded.
+    private var persistsStoryProgress = false
+
     // ---- Debug overlay (only created when ResourceFolder.debugOverlayEnabled) ----
 
     /// HUD displayed in the top-left when the user enables "Show debug overlay"
@@ -145,9 +153,11 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     /// Cached so we can unsubscribe in deinit (best-effort).
     private var didStopObserver: NSObjectProtocol? = nil
 
-    /// Subscription to the configure-sheet settings bridge notification.
-    /// Lets the running screensaver pick up changes made in System Settings
-    /// without needing a full restart.
+    /// Subscription to the IN-PROCESS settings fan-out
+    /// (ResourceFolder.settingsAppliedLocally).  Persistence of bridged
+    /// changes is handled once per process by ResourceFolder's own
+    /// distributed-notification observer; this token only lets this view
+    /// apply the already-persisted value to its running engine.
     private var settingsObserver: NSObjectProtocol? = nil
 
     // (Polling-based zombie detection was removed — see animateOneFrame.)
@@ -346,12 +356,11 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             return
         }
 
-        // Re-sync preferences from disk before reading any settings.
-        // When the legacyScreenSaver preview process is killed and restarted
-        // (which macOS does when the Options sheet is dismissed), cfprefsd may
-        // serve stale cached values to the new process even though the ByHost
-        // plist file was updated by the previous instance via writeToOwnByHostPlist.
-        // CFPreferencesSynchronize forces a re-read from the plist file.
+        // Drop the in-process preferences cache before reading any settings,
+        // so values written by another saver instance (or persisted by the
+        // bridge just before a previous process was killed) are re-fetched
+        // from cfprefsd — the daemon is the shared source of truth for every
+        // process in the container.
         ResourceFolder.flushPreferences()
 
         NSLog("[Johnny] startupIfNeeded: starting — process=%@",
@@ -395,6 +404,8 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         //    display.  Restrict audio to the main display only; all others use
         //    a silent sink so we don't get a cacophony of simultaneous audio.
         let isMainDisplay = window?.screen == NSScreen.main || NSScreen.main == nil
+        // Same gate elects the single story-progress writer for this session.
+        persistsStoryProgress = isMainDisplay
         if ResourceFolder.soundEnabled && isMainDisplay {
             soundSink = AVAudioPlayerSoundSink(folder: folder)
             NSLog("[Johnny] startupIfNeeded: sound ON")
@@ -725,8 +736,11 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
                         // sheet's force-day override.  Persisting while
                         // forced would let a temporary diagnostic override
                         // (e.g. "preview day 8") leak into the permanent
-                        // natural-progression state.
-                        if runner.forceStoryDay == nil {
+                        // natural-progression state.  Also only from the
+                        // elected writer instance (main display) so
+                        // secondary displays' runners don't race the
+                        // persisted day backwards.
+                        if runner.forceStoryDay == nil, persistsStoryProgress {
                             ResourceFolder.saveStoryProgress(
                                 day:             runner.storyDay,
                                 lastCalendarDay: runner.lastCalendarDay
@@ -803,22 +817,20 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             self.scheduleEmergencyExitIfNeeded()
         }
 
+        // Settings bridge: persistence of incoming changes is handled by ONE
+        // process-wide observer (ResourceFolder.installSettingsBridge) —
+        // Sonoma+ never destroys piled-up view instances, so persisting here
+        // per-instance would rewrite the preferences domain N times per
+        // change.  Each view only listens for the in-process fan-out to
+        // apply the already-persisted value to its own running engine.
+        ResourceFolder.installSettingsBridge()
         guard settingsObserver == nil else { return }
-        settingsObserver = DistributedNotificationCenter.default().addObserver(
-            forName: ResourceFolder.settingsChangedNotification,
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: ResourceFolder.settingsAppliedLocally,
             object:  nil,
             queue:   .main
         ) { [weak self] notification in
-            // Persist the incoming value into our own ScreenSaverDefaults so
-            // future launches of legacyScreenSaver see the updated setting.
-            ResourceFolder.applyNotification(notification)
-            // Decode the key from the object-field payload "key|type:value".
-            // macOS strips userInfo from distributed notifications sent by
-            // sandboxed processes; the object field (a String) is preserved.
-            guard let payload = notification.object as? String,
-                  let keyPart = payload.split(separator: "|", maxSplits: 1).first
-            else { return }
-            let key = String(keyPart)
+            guard let key = notification.object as? String else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.applyLiveSettingChange(key: key)
             }
@@ -878,8 +890,8 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
 
     /// Apply a setting change to the running engine/view without a restart.
     /// `key` is the raw ScreenSaverDefaults key string from ResourceFolder;
-    /// the current value is read from ResourceFolder (already updated by
-    /// `applyNotification` before this is called).
+    /// the current value is read from ResourceFolder (already persisted by
+    /// the process-wide bridge before the fan-out fires).
     private func applyLiveSettingChange(key: String) {
         NSLog("[Johnny] applyLiveSettingChange: key=%@", key)
         // Keys are the raw ScreenSaverDefaults key strings from ResourceFolder.

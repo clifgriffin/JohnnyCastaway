@@ -82,13 +82,54 @@ enum ResourceFolder {
     // "key|type:value" in the notification's object field (a plain NSString),
     // which IS preserved across sandbox boundaries.
     //
-    // When a legacyScreenSaver instance receives the notification it:
-    //   1. Writes the value to its own sharedDefaults (in-memory + CFPreferences flush)
-    //   2. Also writes directly to its ByHost plist file so the value survives
-    //      the process being killed and restarted when Options is dismissed.
+    // Receiving side: installSettingsBridge() registers ONE process-wide
+    // observer (Sonoma+ never destroys ScreenSaverView instances, so a
+    // per-instance observer would apply each change N times).  The observer
+    // persists the value through sharedDefaults — i.e. through cfprefsd,
+    // which owns the preferences plist and serialises concurrent writers
+    // across every process sharing the container — then fans the key out
+    // in-process via settingsAppliedLocally so live views can react.
+    //
+    // We must NEVER write the plist file directly: cfprefsd serves reads
+    // from its cache (it does not re-read an externally modified file) and
+    // rewrites the whole file from that cache on the next API write, so a
+    // direct write is both invisible to readers and eventually clobbered.
+    // Values handed to cfprefsd survive the writing process being killed —
+    // the daemon, not the client, persists them.
 
     /// Distributed-notification name posted when any configure-sheet setting changes.
     static let settingsChangedNotification = Notification.Name("nz.petesmith.JohnnyScreenSaver.settingsChanged")
+
+    /// In-process notification posted (on the main queue) after
+    /// installSettingsBridge() has persisted a bridged setting.  The
+    /// notification object is the raw defaults key (String); views observe
+    /// this to apply live changes to a running engine.
+    static let settingsAppliedLocally = Notification.Name("nz.petesmith.JohnnyScreenSaver.settingsAppliedLocally")
+
+    /// Process-wide observer token for the distributed settings bridge.
+    /// Only ever touched from the main thread (view init / bridge callback).
+    private nonisolated(unsafe) static var bridgeObserver: NSObjectProtocol? = nil
+
+    /// Install the process-wide settings bridge.  Idempotent; call from any
+    /// view init.  Exactly one observer per process persists each incoming
+    /// change (no matter how many ScreenSaverView instances have piled up),
+    /// then rebroadcasts the key in-process via settingsAppliedLocally.
+    static func installSettingsBridge() {
+        guard bridgeObserver == nil else { return }
+        bridgeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: settingsChangedNotification,
+            object:  nil,
+            queue:   .main
+        ) { notification in
+            applyNotification(notification)
+            guard let payload = notification.object as? String,
+                  let keyPart = payload.split(separator: "|", maxSplits: 1).first
+            else { return }
+            NotificationCenter.default.post(name: settingsAppliedLocally,
+                                            object: String(keyPart))
+        }
+        NSLog("[Johnny] ResourceFolder: settings bridge installed (process-wide)")
+    }
 
     /// Post a distributed notification so all running legacyScreenSaver instances
     /// pick up the new value immediately.  Key+value are encoded as
@@ -115,12 +156,9 @@ enum ResourceFolder {
     }
 
     /// Decode the payload from a received distributed notification and persist
-    /// the new value into the local ScreenSaverDefaults.  Called from
-    /// JohnnyScreenSaverView when running inside legacyScreenSaver.
-    ///
-    /// Also writes directly to the ByHost plist so the value survives
-    /// legacyScreenSaver being killed and restarted when Options is closed.
-    static func applyNotification(_ notification: Notification) {
+    /// the new value into the local ScreenSaverDefaults.  Called only from the
+    /// process-wide bridge observer installed by installSettingsBridge().
+    private static func applyNotification(_ notification: Notification) {
         guard let payload = notification.object as? String else {
             NSLog("[Johnny] ResourceFolder: applyNotification — no object payload (userInfo stripped by sandbox)")
             return
@@ -142,52 +180,23 @@ enum ResourceFolder {
 
         sharedDefaults.set(value, forKey: key)
         flushPreferences()
-        // Belt-and-suspenders: also write directly to the ByHost plist file.
-        // flushPreferences() may not complete before macOS kills the preview
-        // process on Options-sheet close; a direct atomic file write survives.
-        writeToOwnByHostPlist(key: key, value: value)
         NSLog("[Johnny] ResourceFolder: applied key=%@ value=%@", key, "\(value)")
     }
 
-    /// Force a bidirectional sync with cfprefsd: flushes pending in-process writes
-    /// to disk and re-reads any values that were changed externally (e.g. by a
-    /// previous legacyScreenSaver instance that wrote via writeToOwnByHostPlist).
-    /// Call this at the start of startupIfNeeded() so that settings read during
-    /// startup reflect values written by the previous process before it was killed.
+    /// Synchronisation barrier with cfprefsd: hands any pending in-process
+    /// writes to the daemon (so they survive this process being killed — the
+    /// daemon persists them, not us) and drops the in-process read cache so
+    /// the next read fetches the daemon's current view of the domain.
+    ///
+    /// Note this does NOT re-read the plist file from disk — cfprefsd owns
+    /// that file and serves reads from its own cache.  That is exactly why
+    /// all writes must go through the API: the daemon is the source of
+    /// truth, and it is shared by every process in the container, which is
+    /// what keeps multiple simultaneous saver instances coherent.
     static func flushPreferences() {
         let id = Bundle(for: JohnnyScreenSaverView.self).bundleIdentifier
                      ?? "nz.petesmith.JohnnyScreenSaver"
         CFPreferencesSynchronize(id as CFString, kCFPreferencesCurrentUser, kCFPreferencesCurrentHost)
-    }
-
-    /// Write key=value atomically to our own ByHost plist.
-    /// Effective only when called from within legacyScreenSaver (our own container).
-    private static func writeToOwnByHostPlist(key: String, value: Any) {
-        let byHostDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(
-                "Library/Containers/com.apple.ScreenSaver.Engine.legacyScreenSaver" +
-                "/Data/Library/Preferences/ByHost"
-            )
-        let bundleID = "nz.petesmith.JohnnyScreenSaver"
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: byHostDir, includingPropertiesForKeys: nil
-        ), let plistURL = files.first(where: {
-            $0.lastPathComponent.hasPrefix(bundleID) && $0.pathExtension == "plist"
-        }) else {
-            NSLog("[Johnny] ResourceFolder: writeToOwnByHostPlist — plist not found")
-            return
-        }
-        do {
-            var dict: [String: Any] = (try? Data(contentsOf: plistURL)).flatMap {
-                try? PropertyListSerialization.propertyList(from: $0, options: [], format: nil) as? [String: Any]
-            } ?? [:]
-            dict[key] = value
-            let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
-            try data.write(to: plistURL, options: .atomic)
-            NSLog("[Johnny] ResourceFolder: writeToOwnByHostPlist — wrote %@=%@", key, "\(value)")
-        } catch {
-            NSLog("[Johnny] ResourceFolder: writeToOwnByHostPlist — failed: %@", error.localizedDescription)
-        }
     }
 
     // Multi-day-arc persistence: written every time the engine advances
@@ -539,7 +548,15 @@ enum ResourceFolder {
 
     /// Save the engine's natural-progression state for the next activation.
     /// Called after `beginNextSequence`; cheap (≤ once per ~30 s).
+    ///
+    /// No-op when the persisted state already matches: most sequences don't
+    /// advance the day, and skipping the write keeps the (container-shared)
+    /// preferences domain quiet so concurrent saver instances aren't racing
+    /// each other for no reason.
     static func saveStoryProgress(day: Int, lastCalendarDay: Int) {
+        guard day != persistedStoryDay || lastCalendarDay != persistedLastCalendarDay else {
+            return
+        }
         sharedDefaults.set(day,             forKey: progressDayKey)
         sharedDefaults.set(lastCalendarDay, forKey: progressCalDayKey)
         flushPreferences()
