@@ -129,6 +129,18 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         NSLog("[Johnny][stall] monitor thread started (threshold=%.0fs)", stallThreshold)
     }
 
+    /// Stop the background polling thread.  Idempotent; `start()` may be
+    /// called again afterwards (a fresh thread is created).  The poller
+    /// checks `isCancelled` after each 3 s sleep, so the thread exits within
+    /// one check interval.  Called from teardown() so piled-up leaked view
+    /// instances (Sonoma+ never deallocates ScreenSaverView) don't each keep
+    /// a monitor thread alive for the life of the process.
+    func stop() {
+        setActive(false)
+        thread?.cancel()
+        thread = nil
+    }
+
     /// Enable/disable stall detection.  The view calls `setActive(true)` only
     /// while genuinely full-screen in legacyScreenSaver, and `setActive(false)`
     /// on every stop/teardown — so a *legitimate* stop (which runs on the main

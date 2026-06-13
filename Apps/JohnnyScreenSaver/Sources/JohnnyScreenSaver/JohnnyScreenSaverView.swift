@@ -160,18 +160,185 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     /// apply the already-persisted value to its running engine.
     private var settingsObserver: NSObjectProtocol? = nil
 
-    // (Polling-based zombie detection was removed — see animateOneFrame.)
+    // (Polling-based zombie detection via getppid() was removed: on Tahoe
+    // legacyScreenSaver is spawned by launchd directly, so PPID is 1 from
+    // birth and a parent change can never be observed.  The idle gate below
+    // and the stale-instance reaper in startAnimation replace its intent.)
 
-    /// Our parent PID captured at init.  When the screensaver's host
-    /// process dies, the kernel reparents us to launchd (PID 1).  A
-    /// `getppid()` change is therefore a reliable, kernel-level signal
-    /// that we've been orphaned — unlike NSWindow.occlusionState, this
-    /// can't be lied to by the ViewBridge service architecture.
-    private var originalParentPID: pid_t = 1
+    // ---- Idle-based engine gate (Tahoe) ------------------------------
+    //
+    // Measured June 2026 (see project memory): on Tahoe the WallpaperAgent-
+    // hosted legacyScreenSaver calls startAnimation on the wallpaper-window
+    // view at process spawn and NEVER stops it.  A full-screen saver session
+    // merely exposes that always-animating desktop-level window; dismissal
+    // hides it again.  No AppKit or distributed-notification signal reaches
+    // this process in either direction, and every window-visibility API lies
+    // (isVisible always true, occlusionState never .visible, CGWindowList
+    // redacted by the sandbox).  The ONLY trustworthy signal is kernel-level
+    // HID idle time: while a saver session is genuinely displayed there is
+    // no user input (input would dismiss it), so
+    //   • idle time below the threshold  → user is at the machine → the
+    //     session is over (or never started) → freeze engine + rendering;
+    //   • idle time above the threshold  → user away → animate (if the
+    //     session isn't actually displayed, macOS would have started it
+    //     within the system idle timeout anyway).
+    // Cost of the trade: after a hot-corner activation the saver shows a
+    // frozen frame for the first few seconds until idle crosses the
+    // threshold.
 
-    /// Frame counter for the orphan poll (~1 s at 30 Hz).
-    private var orphanCheckCounter: Int = 0
-    private let orphanCheckInterval: Int = 30
+    /// Engine runs only when the user has been idle at least this long.
+    private static let engineResumeIdleSeconds: Double = 5.0
+
+    /// Current gate state (true = engine frozen because user is active).
+    private var gateQuiesced = false
+
+    /// Cached idle reading, refreshed at most every 0.1 s (the CG call is
+    /// an IPC; no need to pay it at 100 Hz).
+    private var cachedIdleSeconds: Double = .infinity
+    private var lastIdlePoll: CFTimeInterval = 0
+
+    /// Cached session-lock and Settings-frontmost state, refreshed at most
+    /// every 0.5 s.
+    private var cachedScreenLocked = false
+    private var cachedSettingsFrontmost = false
+    private var lastLockPoll: CFTimeInterval = 0
+
+    /// True once at least one frame reached the layer; the idle gate stays
+    /// open until then so a spawn during user activity still paints the
+    /// wallpaper instead of leaving it black.
+    private var hasRenderedOnce = false
+
+    /// True when the engine produced a frame that hasn't been rendered yet.
+    /// animateOneFrame fires at 100 Hz for pacing, but engine ticks are much
+    /// rarer — rendering only when the framebuffer actually changed cuts the
+    /// constant 100 fps drawable/encode churn observed in diagnostics.
+    private var framePending = true
+
+    /// Wall clock of the most recent startAnimation, used to tell the
+    /// start-of-session didstop broadcast (aimed at other instances) from a
+    /// genuine stop directed at us.
+    private var lastStartAnimationAt: CFTimeInterval = 0
+
+    /// Weak registry of every view instance in this process.  Sonoma+ leaks
+    /// ScreenSaverView instances (38 observed in one process); whenever a new
+    /// instance starts animating, it reaps engines of stale siblings whose
+    /// windows are gone.
+    private static let allInstances = NSHashTable<JohnnyScreenSaverView>.weakObjects()
+
+    // ---- Diagnostic instrumentation (instance-pile-up investigation) ----
+    //
+    // Sonoma+ leaks ScreenSaverView instances (38 observed in one
+    // legacyScreenSaver process), and at least one leaked view keeps
+    // animating at full engine rate.  Each instance gets a short ID and
+    // logs a one-line window-state snapshot on every lifecycle event plus
+    // a rate-limited heartbeat from animateOneFrame, so `log stream` can
+    // show which instance is burning CPU and what its window looks like
+    // (level / visibility / occlusion) at the time.
+
+    /// Monotonic per-process counter giving each view a stable log ID.
+    private static var diagNextInstanceID: Int = 0
+
+    private let instanceID: Int = {
+        JohnnyScreenSaverView.diagNextInstanceID += 1
+        return JohnnyScreenSaverView.diagNextInstanceID
+    }()
+
+    /// Wall clock of the last animateOneFrame heartbeat log.
+    private var diagLastHeartbeat: CFTimeInterval = 0
+
+    /// animateOneFrame invocations since the last heartbeat (timer rate check).
+    private var diagFrameCount: Int = 0
+
+    /// Diag lines go to a file in the sandbox container's tmp dir — NSLog
+    /// from the legacyScreenSaver appex never reaches the unified log on
+    /// Tahoe, so a file the saver can write without a security scope
+    /// (readable from outside at ~/Library/Containers/com.apple.ScreenSaver
+    /// .Engine.legacyScreenSaver/Data/tmp/) is the only reliable channel.
+    private static let diagFileURL =
+        URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("johnny-diag.log")
+
+    private static let diagTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    private static func diagAppend(_ line: String) {
+        let msg = "\(diagTimeFormatter.string(from: Date())) \(line)\n"
+        guard let data = msg.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: diagFileURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: diagFileURL, options: .atomic)
+        }
+    }
+
+    /// Seconds since the last HID input event of any kind in this login
+    /// session.  kCGAnyInputEventType == (CGEventType)(~0); imported ObjC
+    /// enums accept arbitrary raw values, so the force-unwrap is safe.
+    private static var secondsSinceLastUserInput: Double {
+        CGEventSource.secondsSinceLastEventType(
+            .combinedSessionState,
+            eventType: CGEventType(rawValue: ~0)!)
+    }
+
+    /// True while the session is locked — i.e. the saver's clock/password
+    /// unlock UI is up.  Input during that state is the user *unlocking*,
+    /// not working, so the engine must keep animating (Apple's savers do).
+    /// The key is ABSENT from the session dictionary when unlocked; only a
+    /// truthy value means locked (checking mere presence is wrong — the
+    /// sandboxed appex sees the key with a false value while unlocked).
+    private static var screenIsLocked: Bool {
+        guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any],
+              let value = dict["CGSSessionScreenIsLocked"]
+        else { return false }
+        return (value as? NSNumber)?.boolValue ?? false
+    }
+
+    /// True while System Settings is the frontmost app — i.e. the user may
+    /// be looking at the Screen Saver pane's live preview, which must keep
+    /// animating despite their mouse activity.  This is the ONLY way to
+    /// exempt the preview: measured June 2026, preview views are pixel-for-
+    /// pixel indistinguishable from real saver views (same process, same
+    /// NSServiceViewControllerWindow class, same desktop window level —
+    /// which is even dynamic — same 1512×982 frame, isPreview false).
+    /// NSWorkspace IS available to the sandboxed appex (verified: returns
+    /// com.apple.loginwindow during lock).
+    private static var settingsIsFrontmost: Bool {
+        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            == "com.apple.systempreferences"
+    }
+
+    /// One-line state snapshot logged on lifecycle events and gate
+    /// transitions.  Always sent to NSLog (effectively invisible on Tahoe —
+    /// the appex's NSLog never reaches the unified log — but free); written
+    /// to the diag file only while the user's debug-overlay toggle is on,
+    /// so a release install doesn't grow a log file forever.
+    private func diagLog(_ context: String) {
+        let w = window
+        let frame = w.map { NSStringFromRect($0.frame) } ?? "(no window)"
+        let level = w.map { String($0.level.rawValue) } ?? "-"
+        let cls   = w.map { String(describing: type(of: $0)) } ?? "-"
+        let behav = w.map { String($0.collectionBehavior.rawValue) } ?? "-"
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil"
+        let line = String(
+            format: "pid=%d #%d %@ anim=%d engine=%d gate=%@ locked=%d idle=%.1f preview=%d level=%@ cls=%@ behav=%@ front=%@ frame=%@",
+            getpid(), instanceID, context,
+            isAnimating ? 1 : 0,
+            renderer != nil ? 1 : 0,
+            gateQuiesced ? "Q" : "R",
+            cachedScreenLocked ? 1 : 0,
+            Self.secondsSinceLastUserInput,
+            isPreview ? 1 : 0,
+            level, cls, behav, front, frame)
+        NSLog("[Johnny][diag] %@", line)
+        if ResourceFolder.debugOverlayEnabled {
+            Self.diagAppend(line)
+        }
+    }
 
     // ---------------------------------------------------------------
     // MARK: Init
@@ -189,21 +356,20 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         // steps to within one timer interval, matching grFadeOut()'s
         // eventsWaitTick(1) = 20 ms per wipe step.
         animationTimeInterval = 1.0 / 100.0
-        originalParentPID = getppid()
-        NSLog("[Johnny] init(frame:isPreview:) preview=%d process=%@ parentPID=%d",
-              isPreview ? 1 : 0, ProcessInfo.processInfo.processName, originalParentPID)
+        NSLog("[Johnny] init(frame:isPreview:) preview=%d process=%@",
+              isPreview ? 1 : 0, ProcessInfo.processInfo.processName)
         installDismissalObservers()
-        stallMonitor.start()
+        Self.allInstances.add(self)
+        diagLog("init(frame:isPreview:)")
     }
 
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
         wantsLayer = true
         animationTimeInterval = 1.0 / 100.0
-        originalParentPID = getppid()
-        NSLog("[Johnny] init(coder:) parentPID=%d", originalParentPID)
+        NSLog("[Johnny] init(coder:)")
         installDismissalObservers()
-        stallMonitor.start()
+        Self.allInstances.add(self)
     }
 
     // ---------------------------------------------------------------
@@ -224,6 +390,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         if let metalLayer = layer as? CAMetalLayer {
             metalLayer.drawableSize = convertToBacking(bounds.size)
         }
+        framePending = true
     }
 
     // ---------------------------------------------------------------
@@ -252,7 +419,26 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
               NSStringFromSize(window?.frame.size ?? .zero))
 
         super.startAnimation()
+        lastStartAnimationAt = CACurrentMediaTime()
+        diagLog("startAnimation")
+
+        // Reap stale siblings: Sonoma+ leaks old view instances, and some
+        // keep a live engine ticking after their window is gone.  Any other
+        // instance without a visible window can't be a legitimate display
+        // (multi-monitor instances all have visible windows), so drop its
+        // engine.  teardown() is idempotent and cheap on already-clean views.
+        for stale in Self.allInstances.allObjects where stale !== self {
+            let windowGone = stale.window == nil || stale.window?.isVisible == false
+            if windowGone, stale.renderer != nil {
+                NSLog("[Johnny] reaping stale instance with live engine (window gone)")
+                stale.diagLog("reaped")
+                stale.teardown()
+            }
+        }
+
         startupIfNeeded()
+        framePending = true
+        stallMonitor.start()
 
         // Arm the stall monitor only for genuine full-screen activation inside
         // legacyScreenSaver.  This keeps the System Settings preview pane (and
@@ -306,6 +492,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
 
     public override func stopAnimation() {
         super.stopAnimation()
+        diagLog("stopAnimation")
         // A real stopAnimation runs on the main thread, which proves it's
         // alive — so stand the stall monitor down to avoid flagging the
         // (legitimate) heartbeat gap that follows as a wedge.
@@ -330,6 +517,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        diagLog("viewDidMoveToWindow")
         if window == nil {
             // Sonoma+ workaround: stopAnimation() doesn't fire
             // reliably when the screensaver dismisses. Tear down
@@ -341,6 +529,8 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
 
     public override func viewWillMove(toSuperview newSuperview: NSView?) {
         super.viewWillMove(toSuperview: newSuperview)
+        diagLog(newSuperview == nil ? "viewWillMove(toSuperview: nil)"
+                                    : "viewWillMove(toSuperview: set)")
         if newSuperview == nil {
             teardown()
         }
@@ -654,8 +844,20 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     // ---------------------------------------------------------------
 
     private func teardown() {
-        // Teardown runs on the main thread (proving it's alive); stop watching.
-        stallMonitor.setActive(false)
+        diagLog("teardown")
+        // Stop the 100 Hz animation timer for good.  macOS rarely sends
+        // stopAnimation itself, so without this every torn-down leaked view
+        // keeps firing animateOneFrame forever (measured: 6 dead views ≈ 3%
+        // CPU just in empty timer fires).  Call super directly — our own
+        // stopAnimation override would arm the exit watchdog.  macOS sends
+        // startAnimation on the next activation (observed June 2026), which
+        // re-arms the timer and rebuilds the engine via startupIfNeeded.
+        super.stopAnimation()
+        // Teardown runs on the main thread (proving it's alive); stop the
+        // monitor thread entirely — leaked instances must not each keep a
+        // poller thread alive (37 observed before this fix).  startAnimation
+        // restarts it if this view is ever revived.
+        stallMonitor.stop()
         NSLog("[Johnny] teardown — loadState was %@",
               { switch loadState { case .notLoaded: return "notLoaded"
                                    case .loaded:    return "loaded"
@@ -686,34 +888,66 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     // ---------------------------------------------------------------
 
     public override func animateOneFrame() {
-        // Orphan detection.
-        //
-        // Tahoe sometimes leaks our process: the host that spawned us
-        // (System Settings preview pane, WallpaperLegacyExtension,
-        // loginwindow for full-screen, etc.) exits without telling us,
-        // and we keep ticking in the background reparented to launchd.
-        //
-        // The kernel-level signal is rock-solid: getppid() changes from
-        // our spawning host's PID to 1 (launchd) when our parent dies.
-        // We can't lie to ourselves about this the way the ViewBridge
-        // window can lie about occlusion state.  Polled once a second
-        // because syscalls are cheap.
-        //
-        // Gate by isInLegacyScreenSaver so this never runs in the
-        // configure sheet (which is hosted in System Settings, where
-        // a parent change would mean something else entirely).
-        orphanCheckCounter += 1
-        if orphanCheckCounter >= orphanCheckInterval {
-            orphanCheckCounter = 0
-            if Self.isInLegacyScreenSaver && originalParentPID > 1 {
-                let nowParent = getppid()
-                if nowParent != originalParentPID {
-                    NSLog("[Johnny] orphan detected: parent %d → %d (launchd) — exit(0)",
-                          originalParentPID, nowParent)
-                    soundSink.stopAll()
-                    teardown()
-                    exit(0)
+        // Diag heartbeat (low rate; file write only when the debug-overlay
+        // toggle is on): confirms timer rate (fires ≈ 60×4 quiesced,
+        // 60×100 running) and gate state during soak testing.
+        let nowDiag = CACurrentMediaTime()
+        diagFrameCount += 1
+        if nowDiag - diagLastHeartbeat >= 60.0 {
+            diagLastHeartbeat = nowDiag
+            diagLog("tick.heartbeat fires=\(diagFrameCount)")
+            diagFrameCount = 0
+        }
+
+        // Idle-based engine gate (see the property block at the top of the
+        // class for the full rationale).  Applies ONLY to the desktop-level
+        // wallpaper/saver window (level -2147483625 measured on Tahoe; all
+        // preview windows — System Settings pane included — have normal
+        // non-negative levels and must keep animating while the user mouses
+        // around).  Size is NOT a usable discriminator: the Settings pane's
+        // large preview exceeds 800×600 and was wrongly gated.
+        // (hasRenderedOnce: never gate before the first frame is on the
+        // layer, or a spawn while the user is active leaves the wallpaper
+        // black until the first resume.)
+        if Self.isInLegacyScreenSaver, hasRenderedOnce,
+           let w = window, w.level.rawValue < 0 {
+            if nowDiag - lastIdlePoll >= 0.1 {
+                cachedIdleSeconds = Self.secondsSinceLastUserInput
+                lastIdlePoll = nowDiag
+            }
+            // While the session is locked, the saver IS the active UI (the
+            // user is looking at the clock / typing their password) — input
+            // there must not freeze the animation.  Likewise while System
+            // Settings is frontmost: the user may be watching the Screen
+            // Saver pane's preview.  Poll both at 0.5 s; these calls are
+            // heavier than the idle query.
+            if nowDiag - lastLockPoll >= 0.5 {
+                cachedScreenLocked      = Self.screenIsLocked
+                cachedSettingsFrontmost = Self.settingsIsFrontmost
+                lastLockPoll = nowDiag
+            }
+            if cachedIdleSeconds < Self.engineResumeIdleSeconds,
+               !cachedScreenLocked, !cachedSettingsFrontmost {
+                if !gateQuiesced {
+                    gateQuiesced = true
+                    // Halt the in-flight sample but keep the players loaded —
+                    // the next session resumes on the same engine and sink.
+                    (soundSink as? AVAudioPlayerSoundSink)?.stopCurrent()
+                    // Even an empty animateOneFrame costs real CPU at 100 Hz
+                    // (each fire runs inside NSAnimationContext machinery) —
+                    // drop to 4 Hz while frozen.  Resume latency is bounded
+                    // by one quiesced frame (≤ 0.25 s).
+                    animationTimeInterval = 0.25
+                    diagLog("gate.quiesce")
                 }
+                // Frozen frame stays on the layer; no tick, no render.
+                return
+            }
+            if gateQuiesced {
+                gateQuiesced = false
+                animationTimeInterval = 1.0 / 100.0
+                framePending = true     // push a frame immediately on resume
+                diagLog("gate.resume")
             }
         }
 
@@ -766,16 +1000,25 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
                 lastTickWall = now
                 renderer.update(framebuffer: runner.composedFramebuffer,
                                 palette:    runner.palette)
+                framePending = true
             }
         }
-        // (If no story runner, the framebuffer was either never
-        // updated or holds the last good frame — render anyway so the
-        // display stays alive.)
+        // (If no story runner, the initial framePending=true pushed one
+        // frame at startup and the layer holds it; nothing to animate.)
+
+        // Render only when the engine actually produced a new frame (or a
+        // resize/resume forced one).  animateOneFrame fires at 100 Hz for
+        // tick pacing, but encoding + presenting 100 identical frames per
+        // second was measured to be the bulk of the saver's steady-state
+        // CPU cost.  CAMetalLayer keeps presenting the last frame.
+        guard framePending else { return }
 
         stallMonitor.beat("nextDrawable")
         guard let drawable = metalLayer.nextDrawable() else { return }
         stallMonitor.beat("render")
         renderer.render(to: drawable, drawableSize: metalLayer.drawableSize)
+        framePending = false
+        hasRenderedOnce = true
 
         // Update the debug HUD (cheap; only allocates a string once per frame).
         if debugOverlay != nil { updateDebugOverlay() }
@@ -802,19 +1045,30 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         ) { [weak self] _ in
             guard let self else { return }
             // com.apple.screensaver.didstop is a system-wide distributed
-            // notification.  When a hot-corner screensaver starts, macOS
+            // notification.  (Measured June 2026: on Tahoe it never fires at
+            // all — the wallpaper-window architecture sends this process
+            // nothing — so this handler matters only on macOS versions that
+            // still post it.)  When a screensaver session starts, macOS
             // posts it to tell the WallpaperAgent's background screensaver
-            // to stop — but our full-screen instance receives it too.
-            // If we're currently animating the notification is not ours;
-            // acting on it would tear down the running screensaver, arm
-            // the watchdog, and force an unexpected exit(0) 8 seconds in.
-            guard !self.isAnimating else {
-                NSLog("[Johnny] didstop received but ignored — currently animating (not our stop)")
+            // to stop — a freshly-started full-screen instance receives it
+            // too and must not act on it.  Guarding on isAnimating was a
+            // dead spot: a LEAKED view never gets stopAnimation, stays
+            // isAnimating forever, and so ignored the very notification
+            // that should stop it.  Discriminate by time instead: only a
+            // view whose startAnimation was moments ago is the new session
+            // the broadcast isn't aimed at.
+            let sinceStart = CACurrentMediaTime() - self.lastStartAnimationAt
+            guard !(self.isAnimating && sinceStart < 2.0) else {
+                self.diagLog("didstop.ignored(justStarted)")
+                NSLog("[Johnny] didstop received but ignored — startAnimation %.2fs ago (not our stop)", sinceStart)
                 return
             }
+            self.diagLog("didstop.teardown")
             NSLog("[Johnny] didstop received — tearing down")
             self.teardown()
-            self.scheduleEmergencyExitIfNeeded()
+            // No scheduleEmergencyExitIfNeeded() here: on wallpaper-duty
+            // views an exit(0) would just churn WallpaperAgent respawns
+            // (observed May 2026).  The watchdog stays tied to stopAnimation.
         }
 
         // Settings bridge: persistence of incoming changes is handled by ONE

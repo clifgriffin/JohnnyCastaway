@@ -70,6 +70,16 @@ final class AVAudioPlayerSoundSink: SoundSink, @unchecked Sendable {
         NSLog("[Johnny] playSample(%d)", id)
     }
 
+    /// Stop the currently-playing sample but KEEP the loaded players, so
+    /// playback can resume later without rebuilding the sink.  Used by the
+    /// idle-gate quiesce path (user input detected → saver session over),
+    /// which must be cheaply reversible — the next saver session reuses the
+    /// same engine and sink.
+    func stopCurrent() {
+        current?.stop()
+        current = nil
+    }
+
     /// Stop all playback immediately AND release the AVAudioPlayer
     /// instances.
     ///
