@@ -510,6 +510,11 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         soundSink.stopAll()
         NSLog("[Johnny] stopAnimation: audio silenced")
 
+        // Commit the latest story day to cfprefsd while the engine is still
+        // alive (stopAnimation does not tear it down).  No-ops when nothing
+        // changed; the engine survives, so this is cheap.
+        persistStoryProgressNow()
+
         // Arm the runaway-host watchdog (gated by process name and
         // full-screen mode — see scheduleEmergencyExitIfNeeded).
         scheduleEmergencyExitIfNeeded()
@@ -840,11 +845,38 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     }
 
     // ---------------------------------------------------------------
+    // MARK: Story-progress persistence at teardown
+    // ---------------------------------------------------------------
+
+    /// Hand the engine's current story progress to cfprefsd at a lifecycle
+    /// hook.  During a run we only save when the day actually changes; this
+    /// makes sure the latest state is committed when the saver is dismissed
+    /// or torn down.  Best-effort and idempotent — `saveStoryProgress`
+    /// no-ops when nothing changed.  Gated identically to the in-run save:
+    /// never persist a forced (diagnostic) day, and only from the elected
+    /// main-display writer so secondary displays can't race the day back.
+    ///
+    /// Note: on Tahoe the wallpaper instance often receives neither
+    /// stopAnimation nor viewDidMoveToWindow(nil), so this is a belt-and-
+    /// suspenders commit — the reliable persistence path is the per-day
+    /// save during the run.  It still helps on real dismissals and on
+    /// macOS versions that do deliver these callbacks.
+    private func persistStoryProgressNow() {
+        guard let runner = storyRunner,
+              runner.forceStoryDay == nil,
+              persistsStoryProgress else { return }
+        ResourceFolder.saveStoryProgress(day: runner.storyDay,
+                                         lastCalendarDay: runner.lastCalendarDay)
+    }
+
+    // ---------------------------------------------------------------
     // MARK: Teardown (Sonoma-reliable)
     // ---------------------------------------------------------------
 
     private func teardown() {
         diagLog("teardown")
+        // Commit the latest story day before we drop the engine.
+        persistStoryProgressNow()
         // Stop the 100 Hz animation timer for good.  macOS rarely sends
         // stopAnimation itself, so without this every torn-down leaked view
         // keeps firing animateOneFrame forever (measured: 6 dead views ≈ 3%

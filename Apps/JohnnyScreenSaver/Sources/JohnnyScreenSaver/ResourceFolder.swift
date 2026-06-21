@@ -183,20 +183,24 @@ enum ResourceFolder {
         NSLog("[Johnny] ResourceFolder: applied key=%@ value=%@", key, "\(value)")
     }
 
-    /// Synchronisation barrier with cfprefsd: hands any pending in-process
-    /// writes to the daemon (so they survive this process being killed — the
-    /// daemon persists them, not us) and drops the in-process read cache so
-    /// the next read fetches the daemon's current view of the domain.
+    /// Persistence barrier: commit any pending writes buffered on our
+    /// ScreenSaverDefaults object down to cfprefsd.  This is the
+    /// Apple-intended commit path for an NSUserDefaults/ScreenSaverDefaults
+    /// instance — `set(_:forKey:)` buffers the value inside *this object*,
+    /// and `synchronize()` is what hands that buffer to the daemon.  Once
+    /// cfprefsd has the value it owns persistence: it survives this
+    /// (frequently SIGKILL'd) appex being killed, and the daemon flushes it
+    /// to the ByHost plist on its own schedule.  We never write that file
+    /// ourselves — cfprefsd owns it; that is the rule the June-2026 fix
+    /// established and we are keeping it.
     ///
-    /// Note this does NOT re-read the plist file from disk — cfprefsd owns
-    /// that file and serves reads from its own cache.  That is exactly why
-    /// all writes must go through the API: the daemon is the source of
-    /// truth, and it is shared by every process in the container, which is
-    /// what keeps multiple simultaneous saver instances coherent.
+    /// IMPORTANT: do NOT call the free CFPreferencesSynchronize() C function
+    /// here.  It reconciles cfprefsd's *existing* cache for the domain but
+    /// never reaches into this object's write buffer, so values set via the
+    /// NSUserDefaults API never actually reached the daemon — the on-disk
+    /// plist froze the moment the old direct-file-write fallback was removed.
     static func flushPreferences() {
-        let id = Bundle(for: JohnnyScreenSaverView.self).bundleIdentifier
-                     ?? "nz.petesmith.JohnnyScreenSaver"
-        CFPreferencesSynchronize(id as CFString, kCFPreferencesCurrentUser, kCFPreferencesCurrentHost)
+        sharedDefaults.synchronize()
     }
 
     // Multi-day-arc persistence: written every time the engine advances
