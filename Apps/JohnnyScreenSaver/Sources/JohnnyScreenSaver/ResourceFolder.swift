@@ -52,7 +52,6 @@
 import Foundation
 import AppKit
 import ScreenSaver
-import JohnnyEngine
 
 enum ResourceFolder {
 
@@ -62,7 +61,6 @@ enum ResourceFolder {
     private static let animationSpeedKey  = "AnimationSpeed"   // Double; 1.0 = faithful
     private static let storyDayKey        = "ForceStoryDay"    // Int; 0 = auto, 1–30 = override
     private static let forceHolidayKey    = "ForceHoliday"     // Int; 0=Off,1=Halloween,2=StPatrick,3=Christmas,4=NewYear
-    private static let fidelityModeKey    = "FidelityMode"     // String; "fixed" | "raw"
     private static let debugOverlayKey    = "ShowDebugOverlay" // Bool
 
     // ---------------------------------------------------------------
@@ -469,20 +467,6 @@ enum ResourceFolder {
             sharedDefaults.set(newValue, forKey: forceHolidayKey)
             flushPreferences()
             bridgeToPeerProcesses(key: forceHolidayKey, value: newValue)
-        }
-    }
-
-    /// Engine fidelity mode (`.fixed` = Go-port corrections, `.raw` = jc_reborn).
-    static var fidelityMode: FidelityMode {
-        get {
-            guard let raw = sharedDefaults.string(forKey: fidelityModeKey),
-                  let mode = FidelityMode(rawValue: raw) else { return .fixed }
-            return mode
-        }
-        set {
-            sharedDefaults.set(newValue.rawValue, forKey: fidelityModeKey)
-            flushPreferences()
-            bridgeToPeerProcesses(key: fidelityModeKey, value: newValue.rawValue)
         }
     }
 

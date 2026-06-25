@@ -77,9 +77,6 @@ final class ADSScheduler {
     let graphics: GraphicsState
     let sound:    SoundSink
 
-    /// Controls IF_IS_RUNNING inversion and other jc_reborn-vs-Go differences.
-    var fidelityMode: FidelityMode = .fixed
-
     /// The raw ADS bytecode being interpreted.
     private var adsData:     Data   = Data()
     private var adsDataSize: Int    = 0
@@ -493,13 +490,9 @@ final class ADSScheduler {
                 let slot = readUInt16LE(adsData, at: offset)
                 let tag  = readUInt16LE(adsData, at: offset + 2)
                 offset += 4
-                // .fixed: Go-port correction (ads.go:417) — skip when NOT running.
-                // .raw:   jc_reborn inversion bug — skip when IS running.
-                if fidelityMode == .fixed {
-                    inSkipBlock = !isSceneRunning(slot: slot, tag: tag)
-                } else {
-                    inSkipBlock = isSceneRunning(slot: slot, tag: tag)
-                }
+                // Go-port correction (ads.go:417): skip the block when the
+                // scene is NOT running (jc_reborn inverted this).
+                inSkipBlock = !isSceneRunning(slot: slot, tag: tag)
 
             case 0x1420:  // AND — no action needed
                 break

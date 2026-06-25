@@ -16,8 +16,7 @@
 //
 // Layout (bottom of screen, bottom-to-top z-order):
 //   Row 1 — Transport: Pause/Resume · +1 · +10 · +100 · [Story Loop] ·
-//            [Fixed/Raw fidelity toggle] · [scene picker] · [▶ Play] ·
-//            [👁 Show/Hide readout]
+//            [scene picker] · [▶ Play] · [👁 Show/Hide readout]
 //   Row 2 — Thread scrubber: one pill per active TTM thread (slot:tag
 //            opcode@ip timer). Hidden when isOverlayVisible == false.
 //   Row 3 — Readout: Day · Scene · Tick · Threads · Opcodes · Sound.
@@ -114,11 +113,6 @@ public struct DebugOverlayView: View {
 
             Divider().frame(height: 18)
 
-            // Fidelity-mode toggle
-            fidelityToggle
-
-            Divider().frame(height: 18)
-
             // Scene picker
             Picker("", selection: Binding(
                 get: { selectedSceneID },
@@ -153,33 +147,6 @@ public struct DebugOverlayView: View {
             .buttonStyle(.bordered)
             .help("Toggle visibility of readout and thread scrubber")
             .keyboardShortcut("d", modifiers: [.command])
-        }
-    }
-
-    // MARK: - Fidelity toggle
-
-    private var fidelityToggle: some View {
-        HStack(spacing: 0) {
-            fidelityButton(.fixed, label: "Fixed",
-                           help: "Fixed: apply Go-port corrections (recommended)")
-            fidelityButton(.raw,   label: "Raw",
-                           help: "Raw: jc_reborn-canonical for A/B verification")
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-    }
-
-    @ViewBuilder
-    private func fidelityButton(_ mode: FidelityMode,
-                                label: String,
-                                help: String) -> some View {
-        if state.fidelityMode == mode {
-            Button(label) { state.fidelityMode = mode }
-                .buttonStyle(.borderedProminent)
-                .help(help)
-        } else {
-            Button(label) { state.fidelityMode = mode }
-                .buttonStyle(.bordered)
-                .help(help)
         }
     }
 

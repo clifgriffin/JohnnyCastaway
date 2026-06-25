@@ -92,13 +92,6 @@ struct EngineDebugStateTests {
         #expect(comps.day   == 24)
     }
 
-    @Test("fidelityMode defaults to .fixed")
-    @MainActor
-    func fidelityModeDefault() {
-        let state = EngineDebugState()
-        #expect(state.fidelityMode == .fixed)
-    }
-
     @Test("isOverlayVisible defaults to true")
     @MainActor
     func overlayVisibleDefault() {
@@ -140,52 +133,5 @@ struct EngineDebugStateTests {
         #expect(sink.lastSampleID == 12)
         sink.reset()
         #expect(sink.lastSampleID == nil)
-    }
-}
-
-@Suite("FidelityMode")
-struct FidelityModeTests {
-
-    @Test("FidelityMode has exactly two cases")
-    func casesCount() {
-        #expect(FidelityMode.allCases.count == 2)
-    }
-
-    @Test("isNight .fixed: night = hour < 6 or >= 18")
-    func isNightFixed() {
-        let cal = Calendar.current
-        func makeDate(hour: Int) -> Date {
-            var c = cal.dateComponents([.year, .month, .day], from: Date())
-            c.hour = hour; c.minute = 0; c.second = 0
-            return cal.date(from: c)!
-        }
-        for h in 0..<6 {
-            #expect(SceneScheduler.isNight(date: makeDate(hour: h), fidelityMode: .fixed),
-                    "hour \(h) should be night (.fixed)")
-        }
-        for h in 6..<18 {
-            #expect(!SceneScheduler.isNight(date: makeDate(hour: h), fidelityMode: .fixed),
-                    "hour \(h) should be day (.fixed)")
-        }
-        for h in 18..<24 {
-            #expect(SceneScheduler.isNight(date: makeDate(hour: h), fidelityMode: .fixed),
-                    "hour \(h) should be night (.fixed)")
-        }
-    }
-
-    @Test("isNight .raw: uses (hour % 8) ∈ {0, 7}")
-    func isNightRaw() {
-        let cal = Calendar.current
-        func makeDate(hour: Int) -> Date {
-            var c = cal.dateComponents([.year, .month, .day], from: Date())
-            c.hour = hour; c.minute = 0; c.second = 0
-            return cal.date(from: c)!
-        }
-        let expectedNight: Set<Int> = [0, 7, 8, 15, 16, 23]
-        for h in 0..<24 {
-            let expected = expectedNight.contains(h)
-            #expect(SceneScheduler.isNight(date: makeDate(hour: h), fidelityMode: .raw) == expected,
-                    "hour \(h) raw night mismatch")
-        }
     }
 }

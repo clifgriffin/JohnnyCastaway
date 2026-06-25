@@ -17,8 +17,8 @@
 //
 // Public API:
 //   EngineDebugState   — @Observable @MainActor state: pause/step, scene
-//                        picker, fidelity mode, force-date, overlay toggle,
-//                        sound readout, thread snapshots. Provides tick()
+//                        picker, force-date, overlay toggle, sound readout,
+//                        thread snapshots. Provides tick()
 //                        for JohnnyMetalView.frameProvider.
 //   DebugOverlayView   — SwiftUI View to embed over the Metal view.
 //

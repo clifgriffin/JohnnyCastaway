@@ -21,9 +21,6 @@
 // Pause/step: when `isPaused`, tick() returns nil. `step(_:)` queues N
 // ticks that run even while paused, then re-pauses.
 //
-// Fidelity mode: .fixed applies Go-port corrections (day/night, IF_IS_RUNNING,
-// wave modulo); .raw restores jc_reborn-canonical behaviour for A/B comparison.
-//
 // Sound: a CapturingSoundSink is created here and passed to both Engine and
 // StoryRunner at configure() time; lastSoundTrigger is polled each tick.
 //
@@ -77,17 +74,6 @@ public final class EngineDebugState {
 
     public var isPaused: Bool = false
     public private(set) var pendingSteps: Int = 0
-
-    // ---------------------------------------------------------------
-    // MARK: Fidelity mode
-    // ---------------------------------------------------------------
-
-    public var fidelityMode: FidelityMode = .fixed {
-        didSet {
-            engine?.fidelityMode      = fidelityMode
-            storyRunner?.fidelityMode = fidelityMode
-        }
-    }
 
     // ---------------------------------------------------------------
     // MARK: Scene picker
@@ -165,10 +151,6 @@ public final class EngineDebugState {
         self.threadSnapshots = []
         self.lastSoundTrigger = nil
         soundSink.reset()
-
-        // Apply current fidelity mode to freshly wired objects
-        engine.fidelityMode      = fidelityMode
-        storyRunner.fidelityMode = fidelityMode
     }
 
     // ---------------------------------------------------------------

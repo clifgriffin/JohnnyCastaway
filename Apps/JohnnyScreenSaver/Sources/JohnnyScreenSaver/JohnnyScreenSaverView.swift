@@ -627,7 +627,6 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             //   triggers the matching decoration.
             // • Force Story Day: post-init override on StoryRunner's
             //   forceStoryDay, applied to every beginNextSequence call.
-            // • Fidelity Mode: post-init property on StoryRunner.
             // • Animation Speed: cached for animateOneFrame pacing.
             let holidayCode = ResourceFolder.forceHoliday
             let dateProvider: DateProvider = {
@@ -652,12 +651,10 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
                 initialStoryDay:        persistedDay,
                 initialLastCalendarDay: persistedCalDay
             )
-            runner.fidelityMode = ResourceFolder.fidelityMode
             let forcedDay = ResourceFolder.forceStoryDay
             runner.forceStoryDay = (forcedDay > 0) ? forcedDay : nil
             self.animationSpeed  = ResourceFolder.animationSpeed
-            NSLog("[Johnny] startupIfNeeded: settings — fidelity=%@ forceDay=%d speed=%.2f overlay=%d storyDay=%d (persisted, lastCalDay=%d)",
-                  runner.fidelityMode.rawValue,
+            NSLog("[Johnny] startupIfNeeded: settings — forceDay=%d speed=%.2f overlay=%d storyDay=%d (persisted, lastCalDay=%d)",
                   forcedDay,
                   self.animationSpeed,
                   ResourceFolder.debugOverlayEnabled ? 1 : 0,
@@ -1190,8 +1187,6 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         } else if key == "AnimationSpeed" {
             animationSpeed = ResourceFolder.animationSpeed
             NSLog("[Johnny] applyLiveSettingChange: animationSpeed=%.2f", animationSpeed)
-        } else if key == "FidelityMode" {
-            storyRunner?.fidelityMode = ResourceFolder.fidelityMode
         } else if key == "ForceStoryDay" {
             let day = ResourceFolder.forceStoryDay
             storyRunner?.forceStoryDay = day > 0 ? day : nil
@@ -1256,7 +1251,6 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         let active    = runner?.activeThreadCount ?? 0
         let allocated = runner?.allocatedThreadCount ?? 0
         let opcodes   = runner?.coveredTTMOpcodes.count ?? 0
-        let fidelity  = runner?.fidelityMode.rawValue ?? "—"
         let holiday   = ResourceFolder.forceHoliday
         let holidayLabel: String = {
             switch holiday {
@@ -1273,7 +1267,6 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         day:       \(day)\(runner?.forceStoryDay != nil ? " (forced)" : "")
         threads:   \(active)/\(allocated) active
         opcodes:   \(opcodes) covered
-        fidelity:  \(fidelity)
         holiday:   \(holidayLabel)
         speed:     \(String(format: "%.1f×", animationSpeed))
         last snd:  \(lastSamp.map(String.init) ?? "—")

@@ -191,21 +191,6 @@ public final class StoryRunner {
     // ---------------------------------------------------------------
 
     // ---------------------------------------------------------------
-    // MARK: Fidelity mode
-    // ---------------------------------------------------------------
-
-    /// Propagated to ADSScheduler (IF_IS_RUNNING), IslandRenderer (wave
-    /// modulo), and SceneScheduler.isNight(). Changing it takes effect at
-    /// the start of the next tick for ADS/wave; at the next
-    /// beginNextSequence() call for day/night.
-    public var fidelityMode: FidelityMode = .fixed {
-        didSet {
-            scheduler.fidelityMode = fidelityMode
-            islandRdr.fidelityMode = fidelityMode
-        }
-    }
-
-    // ---------------------------------------------------------------
     // MARK: Story-day override (Phase 6 settings sheet)
     // ---------------------------------------------------------------
 
@@ -293,7 +278,7 @@ public final class StoryRunner {
         lastCalendarDay  = calDay
 
         // Determine night + holiday from date (story.c:94–120, Go fixes)
-        islandState.night   = SceneScheduler.isNight(date: now, fidelityMode: fidelityMode)
+        islandState.night   = SceneScheduler.isNight(date: now)
         islandState.holiday = SceneScheduler.holiday(date: now)
 
         // Plan the scene queue: pick a final scene, then 6–19 non-final scenes

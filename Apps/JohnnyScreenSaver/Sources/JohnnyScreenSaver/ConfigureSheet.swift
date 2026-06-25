@@ -22,7 +22,6 @@
 //   • Animation speed         (0.5× / 1× / 1.5× / 2×)
 //   • Story day               (Auto / 1–30)
 //   • Force holiday           (Off / Halloween / St Patrick / Christmas / NY)
-//   • Engine fidelity mode    (Fixed / Raw)
 //   • Show debug overlay      (Off / On)
 //
 // Note: a security-scoped bookmark is created by save() ONLY when running
@@ -33,7 +32,6 @@
 
 import AppKit
 import ScreenSaver
-import JohnnyEngine
 
 @MainActor
 final class ConfigureSheetController: NSObject {
@@ -48,7 +46,6 @@ final class ConfigureSheetController: NSObject {
     private var speedPopup:     NSPopUpButton!
     private var dayPopup:       NSPopUpButton!
     private var holidayPopup:   NSPopUpButton!
-    private var fidelityPopup:  NSPopUpButton!
     private var debugCheckbox:  NSButton!
 
     // Layout constants — single source of truth so we can adjust the
@@ -65,7 +62,7 @@ final class ConfigureSheetController: NSObject {
     // ---------------------------------------------------------------
 
     private func makeWindow() -> NSWindow {
-        let H: CGFloat = 500
+        let H: CGFloat = 468   // one row shorter since the fidelity popup was removed
         let win = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: H),
             styleMask: [.titled],
@@ -161,15 +158,6 @@ final class ConfigureSheetController: NSObject {
         )
         holidayPopup.selectItem(withTag: ResourceFolder.forceHoliday)
         addRow(label: "Force holiday:", control: holidayPopup, to: content, y: y)
-
-        y -= rowHeight
-        fidelityPopup = makePopup(
-            target: #selector(fidelityChanged),
-            items: ["Fixed (Go corrections)", "Raw (jc_reborn)"],
-            tags:  [0, 1]
-        )
-        fidelityPopup.selectItem(withTag: ResourceFolder.fidelityMode == .fixed ? 0 : 1)
-        addRow(label: "Engine fidelity:", control: fidelityPopup, to: content, y: y)
 
         y -= sectionGap
         addSeparator(to: content, y: y)
@@ -279,7 +267,6 @@ final class ConfigureSheetController: NSObject {
         speedPopup.selectItem(withTag: speedTag(for: ResourceFolder.animationSpeed))
         dayPopup.selectItem(withTag: ResourceFolder.forceStoryDay)
         holidayPopup.selectItem(withTag: ResourceFolder.forceHoliday)
-        fidelityPopup.selectItem(withTag: ResourceFolder.fidelityMode == .fixed ? 0 : 1)
         debugCheckbox.state  = ResourceFolder.debugOverlayEnabled ? .on : .off
     }
 
@@ -327,10 +314,6 @@ final class ConfigureSheetController: NSObject {
 
     @objc private func holidayChanged() {
         ResourceFolder.forceHoliday = holidayPopup.selectedTag()
-    }
-
-    @objc private func fidelityChanged() {
-        ResourceFolder.fidelityMode = (fidelityPopup.selectedTag() == 0) ? .fixed : .raw
     }
 
     @objc private func doneClicked() {

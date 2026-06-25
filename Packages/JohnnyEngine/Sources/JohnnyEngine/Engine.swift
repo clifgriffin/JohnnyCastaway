@@ -154,15 +154,4 @@ public final class Engine {
     /// Snapshot of each running thread's state (slot name, tag, IP, opcode,
     /// timer). Updated live on every `tick()` call.
     public var threadSnapshots: [TTMThreadSnapshot] { scheduler.threadSnapshots }
-
-    // ---------------------------------------------------------------
-    // MARK: Fidelity mode
-    // ---------------------------------------------------------------
-
-    /// Switch between Go-port-corrected (.fixed) and jc_reborn-canonical
-    /// (.raw) behaviour. Takes effect immediately for IF_IS_RUNNING and
-    /// wave-counter changes; day/night takes effect at the next sequence.
-    public var fidelityMode: FidelityMode = .fixed {
-        didSet { scheduler.fidelityMode = fidelityMode }
-    }
 }
