@@ -60,6 +60,20 @@ public enum RendererError: Error, CustomStringConvertible {
     }
 }
 
+// MARK: - Display style
+
+/// How the resolved game image is presented to the screen.
+///
+/// `crisp` and `soft` share the same blit pipeline and differ only in the
+/// sampler (nearest vs linear); `crt` uses the scanline/mask post-process
+/// pipeline.  Raw values are persisted in ScreenSaverDefaults, so keep them
+/// stable.
+public enum DisplayStyle: Int, Sendable, CaseIterable {
+    case crisp = 0   // nearest-neighbour — faithful sharp pixels (default)
+    case soft  = 1   // bilinear smoothing
+    case crt   = 2   // scanlines + shadow mask + vignette
+}
+
 // MARK: - Uniforms (matches Metal Uniforms struct — float4, 16 bytes, 16-byte aligned)
 
 private struct Uniforms {
@@ -67,6 +81,14 @@ private struct Uniforms {
     /// NDC +y = up; so top > bottom.
     var gameRect: SIMD4<Float>
 }
+
+/// Mirrors the Metal `CRTParams` struct (one uint, 16-byte aligned by Metal).
+private struct CRTParams {
+    var curvatureEnabled: UInt32
+}
+
+/// Full-screen NDC rect for the resolve pass (no letterbox): left, top, right, bottom.
+private let fullScreenRect = SIMD4<Float>(-1, 1, 1, -1)
 
 // MARK: - EngineRenderer
 
@@ -82,13 +104,36 @@ public final class EngineRenderer {
 
     private let device:        MTLDevice
     private let commandQueue:  MTLCommandQueue
-    private let pipelineState: MTLRenderPipelineState
+
+    // Pass 1: indexed framebuffer + palette LUT → offscreen RGBA.
+    private let resolvePipeline: MTLRenderPipelineState
+    // Pass 2: resolved RGBA → drawable.
+    private let blitPipeline:    MTLRenderPipelineState   // Crisp / Soft
+    private let crtPipeline:     MTLRenderPipelineState   // CRT
+
+    private let nearestSampler:  MTLSamplerState          // Crisp
+    private let linearSampler:   MTLSamplerState          // Soft + CRT
 
     // R8Uint 640×480 — one byte per pixel, value = palette index (0..15 or 0xFF)
     private let framebufferTexture: MTLTexture
 
     // RGBA8Unorm 16×1 — one RGBA entry per palette colour
     private let paletteTexture: MTLTexture
+
+    // RGBA8Unorm 640×480 — pass-1 output; pass 2 samples this.
+    private let resolvedTexture: MTLTexture
+
+    // ---------------------------------------------------------------
+    // MARK: Public configuration
+    // ---------------------------------------------------------------
+
+    /// How frames are presented.  Defaults to `.crisp` (faithful).
+    /// Safe to change between frames; takes effect on the next `render`.
+    public var displayStyle: DisplayStyle = .crisp
+
+    /// Whether CRT mode applies barrel curvature.  Only consulted when
+    /// `displayStyle == .crt`.
+    public var crtCurvatureEnabled: Bool = false
 
     // ---------------------------------------------------------------
     // MARK: Init
@@ -111,25 +156,38 @@ public final class EngineRenderer {
             throw RendererError.shaderCompilationFailed(error.localizedDescription)
         }
 
-        guard let vertFn = library.makeFunction(name: "vertexShader") else {
-            throw RendererError.shaderFunctionNotFound("vertexShader")
-        }
-        guard let fragFn = library.makeFunction(name: "fragmentShader") else {
-            throw RendererError.shaderFunctionNotFound("fragmentShader")
-        }
+        // Pass 1 (resolve): vertexShader + palette-LUT fragment → rgba8Unorm.
+        // Pass 2 (style): vertexShader + blit/crt fragment → bgra8Unorm drawable.
+        self.resolvePipeline = try Self.makePipeline(
+            device: device, library: library,
+            vertex: "vertexShader", fragment: "fragmentShader",
+            pixelFormat: .rgba8Unorm, label: "JohnnyResolve")
+        self.blitPipeline = try Self.makePipeline(
+            device: device, library: library,
+            vertex: "vertexShader", fragment: "blitFragment",
+            pixelFormat: .bgra8Unorm, label: "JohnnyBlit")
+        self.crtPipeline = try Self.makePipeline(
+            device: device, library: library,
+            vertex: "vertexShader", fragment: "crtFragment",
+            pixelFormat: .bgra8Unorm, label: "JohnnyCRT")
 
-        // Render pipeline
-        let pipelineDesc = MTLRenderPipelineDescriptor()
-        pipelineDesc.label                              = "JohnnyPaletteLUT"
-        pipelineDesc.vertexFunction                     = vertFn
-        pipelineDesc.fragmentFunction                   = fragFn
-        pipelineDesc.colorAttachments[0].pixelFormat    = .bgra8Unorm
-
-        do {
-            self.pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDesc)
-        } catch {
-            throw RendererError.pipelineCreationFailed(error.localizedDescription)
+        // Samplers: nearest = Crisp (sharp), linear = Soft + CRT base sampling.
+        let nearestDesc = MTLSamplerDescriptor()
+        nearestDesc.minFilter = .nearest
+        nearestDesc.magFilter = .nearest
+        nearestDesc.sAddressMode = .clampToEdge
+        nearestDesc.tAddressMode = .clampToEdge
+        let linearDesc = MTLSamplerDescriptor()
+        linearDesc.minFilter = .linear
+        linearDesc.magFilter = .linear
+        linearDesc.sAddressMode = .clampToEdge
+        linearDesc.tAddressMode = .clampToEdge
+        guard let nearest = device.makeSamplerState(descriptor: nearestDesc),
+              let linear  = device.makeSamplerState(descriptor: linearDesc) else {
+            throw RendererError.pipelineCreationFailed("sampler state creation failed")
         }
+        self.nearestSampler = nearest
+        self.linearSampler  = linear
 
         // Framebuffer texture: R8Uint 640×480
         let fbDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -158,6 +216,48 @@ public final class EngineRenderer {
             throw RendererError.textureCreationFailed
         }
         self.paletteTexture = palTex
+
+        // Resolved colour texture: RGBA8Unorm 640×480 — pass-1 render target,
+        // pass-2 sampler source.  Private storage: GPU-only, never read by CPU.
+        let resolvedDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width:  Framebuffer.width,
+            height: Framebuffer.height,
+            mipmapped: false
+        )
+        resolvedDesc.usage       = [.renderTarget, .shaderRead]
+        resolvedDesc.storageMode = .private
+        guard let resolvedTex = device.makeTexture(descriptor: resolvedDesc) else {
+            throw RendererError.textureCreationFailed
+        }
+        self.resolvedTexture = resolvedTex
+    }
+
+    /// Build a render pipeline from named vertex/fragment functions in `library`.
+    private static func makePipeline(
+        device: MTLDevice,
+        library: MTLLibrary,
+        vertex: String,
+        fragment: String,
+        pixelFormat: MTLPixelFormat,
+        label: String
+    ) throws -> MTLRenderPipelineState {
+        guard let vertFn = library.makeFunction(name: vertex) else {
+            throw RendererError.shaderFunctionNotFound(vertex)
+        }
+        guard let fragFn = library.makeFunction(name: fragment) else {
+            throw RendererError.shaderFunctionNotFound(fragment)
+        }
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label                           = label
+        desc.vertexFunction                  = vertFn
+        desc.fragmentFunction                = fragFn
+        desc.colorAttachments[0].pixelFormat = pixelFormat
+        do {
+            return try device.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            throw RendererError.pipelineCreationFailed(error.localizedDescription)
+        }
     }
 
     // ---------------------------------------------------------------
@@ -211,33 +311,66 @@ public final class EngineRenderer {
     /// present smoothly at native refresh rate.
     public func render(to drawable: CAMetalDrawable, drawableSize: CGSize) {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        encodeFrame(into: drawable.texture, drawableSize: drawableSize, commandBuffer: commandBuffer)
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
 
-        let passDesc = MTLRenderPassDescriptor()
-        passDesc.colorAttachments[0].texture     = drawable.texture
-        passDesc.colorAttachments[0].loadAction  = .clear
-        passDesc.colorAttachments[0].clearColor  = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        passDesc.colorAttachments[0].storeAction = .store
+    /// Encode the two-pass frame (resolve + style) into `output` on the given
+    /// command buffer, without presenting.  `render(to:)` targets the
+    /// drawable's texture; offscreen tests target a readable texture.  `output`
+    /// must be `bgra8Unorm` (matches the pass-2 pipelines).
+    func encodeFrame(into output: MTLTexture, drawableSize: CGSize, commandBuffer: MTLCommandBuffer) {
+        let clearBlack = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDesc) else {
-            commandBuffer.commit()
+        // ---- Pass 1: resolve indexed framebuffer → RGBA (full-screen) -------
+        let resolveDesc = MTLRenderPassDescriptor()
+        resolveDesc.colorAttachments[0].texture     = resolvedTexture
+        resolveDesc.colorAttachments[0].loadAction  = .clear
+        resolveDesc.colorAttachments[0].clearColor  = clearBlack
+        resolveDesc.colorAttachments[0].storeAction = .store
+
+        guard let resolveEnc = commandBuffer.makeRenderCommandEncoder(descriptor: resolveDesc) else {
+            return
+        }
+        resolveEnc.setRenderPipelineState(resolvePipeline)
+        var fullRect = Uniforms(gameRect: fullScreenRect)
+        resolveEnc.setVertexBytes(&fullRect, length: MemoryLayout<Uniforms>.stride, index: 0)
+        resolveEnc.setFragmentTexture(framebufferTexture, index: 0)
+        resolveEnc.setFragmentTexture(paletteTexture,     index: 1)
+        resolveEnc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        resolveEnc.endEncoding()
+
+        // ---- Pass 2: present resolved texture with the selected style -------
+        let styleDesc = MTLRenderPassDescriptor()
+        styleDesc.colorAttachments[0].texture     = output
+        styleDesc.colorAttachments[0].loadAction  = .clear
+        styleDesc.colorAttachments[0].clearColor  = clearBlack   // letterbox bars
+        styleDesc.colorAttachments[0].storeAction = .store
+
+        guard let styleEnc = commandBuffer.makeRenderCommandEncoder(descriptor: styleDesc) else {
             return
         }
 
-        encoder.setRenderPipelineState(pipelineState)
+        switch displayStyle {
+        case .crisp:
+            styleEnc.setRenderPipelineState(blitPipeline)
+            styleEnc.setFragmentSamplerState(nearestSampler, index: 0)
+        case .soft:
+            styleEnc.setRenderPipelineState(blitPipeline)
+            styleEnc.setFragmentSamplerState(linearSampler, index: 0)
+        case .crt:
+            styleEnc.setRenderPipelineState(crtPipeline)
+            styleEnc.setFragmentSamplerState(linearSampler, index: 0)
+            var crt = CRTParams(curvatureEnabled: crtCurvatureEnabled ? 1 : 0)
+            styleEnc.setFragmentBytes(&crt, length: MemoryLayout<CRTParams>.stride, index: 0)
+        }
 
-        var uniforms = Uniforms(gameRect: Self.gameRect(for: drawableSize))
-        encoder.setVertexBytes(&uniforms,
-                               length: MemoryLayout<Uniforms>.stride,
-                               index: 0)
-
-        encoder.setFragmentTexture(framebufferTexture, index: 0)
-        encoder.setFragmentTexture(paletteTexture,    index: 1)
-
-        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        encoder.endEncoding()
-
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
+        var letterbox = Uniforms(gameRect: Self.gameRect(for: drawableSize))
+        styleEnc.setVertexBytes(&letterbox, length: MemoryLayout<Uniforms>.stride, index: 0)
+        styleEnc.setFragmentTexture(resolvedTexture, index: 0)
+        styleEnc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        styleEnc.endEncoding()
     }
 
     // ---------------------------------------------------------------

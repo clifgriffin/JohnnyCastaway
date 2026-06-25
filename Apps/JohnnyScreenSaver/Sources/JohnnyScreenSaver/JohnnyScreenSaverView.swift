@@ -573,7 +573,10 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         }
         do {
             renderer = try EngineRenderer(device: device)
-            NSLog("[Johnny] startupIfNeeded: renderer created")
+            renderer?.displayStyle        = DisplayStyle(rawValue: ResourceFolder.displayStyle) ?? .crisp
+            renderer?.crtCurvatureEnabled = ResourceFolder.crtCurvatureEnabled
+            NSLog("[Johnny] startupIfNeeded: renderer created (style=%ld curvature=%d)",
+                  ResourceFolder.displayStyle, ResourceFolder.crtCurvatureEnabled ? 1 : 0)
         } catch {
             NSLog("[Johnny] startupIfNeeded: renderer error — %@", error.localizedDescription)
             loadState = .error("Renderer: \(error.localizedDescription)")
@@ -1190,8 +1193,17 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         } else if key == "ForceStoryDay" {
             let day = ResourceFolder.forceStoryDay
             storyRunner?.forceStoryDay = day > 0 ? day : nil
+        } else if key == "DisplayStyle" {
+            renderer?.displayStyle = DisplayStyle(rawValue: ResourceFolder.displayStyle) ?? .crisp
+            NSLog("[Johnny] applyLiveSettingChange: displayStyle=%ld", ResourceFolder.displayStyle)
+        } else if key == "CRTCurvature" {
+            renderer?.crtCurvatureEnabled = ResourceFolder.crtCurvatureEnabled
+            NSLog("[Johnny] applyLiveSettingChange: crtCurvature=%d", ResourceFolder.crtCurvatureEnabled ? 1 : 0)
         }
         // SoundEnabled, ForceHoliday: require engine restart; no live apply.
+        // ProgressStoryDay / ProgressLastCalendarDay (Restart Story): the
+        // process-wide bridge persists them; the reset is read on the next
+        // activation, so there is no live-apply case here.
     }
 
     // ---------------------------------------------------------------

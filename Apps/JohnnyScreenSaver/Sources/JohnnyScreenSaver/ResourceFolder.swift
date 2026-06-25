@@ -62,6 +62,8 @@ enum ResourceFolder {
     private static let storyDayKey        = "ForceStoryDay"    // Int; 0 = auto, 1–30 = override
     private static let forceHolidayKey    = "ForceHoliday"     // Int; 0=Off,1=Halloween,2=StPatrick,3=Christmas,4=NewYear
     private static let debugOverlayKey    = "ShowDebugOverlay" // Bool
+    private static let displayStyleKey    = "DisplayStyle"     // Int; 0=Crisp (default), 1=Soft, 2=CRT
+    private static let crtCurvatureKey    = "CRTCurvature"     // Bool; CRT barrel curvature
 
     // ---------------------------------------------------------------
     // MARK: Cross-process settings bridge
@@ -480,6 +482,33 @@ enum ResourceFolder {
         }
     }
 
+    /// Display style: 0 = Crisp (nearest, default), 1 = Soft (bilinear),
+    /// 2 = CRT (scanlines/mask/vignette).  Stored as Int to match the
+    /// `DisplayStyle` raw value in JohnnyMetalRenderer.  Unknown/absent → 0.
+    static var displayStyle: Int {
+        get {
+            guard sharedDefaults.object(forKey: displayStyleKey) != nil else { return 0 }
+            let v = sharedDefaults.integer(forKey: displayStyleKey)
+            return (0...2).contains(v) ? v : 0
+        }
+        set {
+            sharedDefaults.set(newValue, forKey: displayStyleKey)
+            flushPreferences()
+            bridgeToPeerProcesses(key: displayStyleKey, value: newValue)
+        }
+    }
+
+    /// Whether CRT mode applies barrel curvature.  Defaults to false (flat).
+    /// Only consulted by the renderer when `displayStyle == 2` (CRT).
+    static var crtCurvatureEnabled: Bool {
+        get { sharedDefaults.bool(forKey: crtCurvatureKey) }
+        set {
+            sharedDefaults.set(newValue, forKey: crtCurvatureKey)
+            flushPreferences()
+            bridgeToPeerProcesses(key: crtCurvatureKey, value: newValue)
+        }
+    }
+
     // ---------------------------------------------------------------
     // MARK: Holiday-date synthesis (for forceHoliday)
     // ---------------------------------------------------------------
@@ -550,13 +579,33 @@ enum ResourceFolder {
         flushPreferences()
     }
 
-    /// Reset the persisted story arc.  Not currently surfaced in the
-    /// configure sheet — exposed for future "Restart story" button.
+    /// Reset the persisted story arc by removing the keys locally.  Works only
+    /// within the process that owns the container; the configure sheet must use
+    /// ``resetStoryProgress()`` instead so the change reaches legacyScreenSaver.
     static func clearStoryProgress() {
         sharedDefaults.removeObject(forKey: progressDayKey)
         sharedDefaults.removeObject(forKey: progressCalDayKey)
         flushPreferences()
         NSLog("[Johnny] ResourceFolder.clearStoryProgress: done")
+    }
+
+    /// Reset the story arc to day 1 from the configure sheet ("Restart Story").
+    ///
+    /// The configure sheet runs in the System Settings extension, whose
+    /// ScreenSaverDefaults container is NOT the one legacyScreenSaver reads —
+    /// so a `removeObject`-based clear would never reach the saver.  Instead we
+    /// SET sentinel values (day = 1, lastCalendarDay = -1, which `persistedStoryDay`
+    /// / `persistedLastCalendarDay` treat exactly like "unset") and bridge both
+    /// keys to peer processes, because the settings bridge replicates `set(_:)`,
+    /// not removal.  Takes effect on the next activation (a running session keeps
+    /// its in-flight StoryRunner).
+    static func resetStoryProgress() {
+        sharedDefaults.set(1,  forKey: progressDayKey)
+        sharedDefaults.set(-1, forKey: progressCalDayKey)
+        flushPreferences()
+        bridgeToPeerProcesses(key: progressDayKey,    value: 1)
+        bridgeToPeerProcesses(key: progressCalDayKey, value: -1)
+        NSLog("[Johnny] ResourceFolder.resetStoryProgress: day=1 calDay=-1 (bridged)")
     }
 
     // ---------------------------------------------------------------

@@ -72,6 +72,18 @@ public final class JohnnyMetalView: NSView {
     /// (Phase 6) will use `EngineRenderer` directly instead of this view.
     public var frameProvider: (@MainActor () -> (Framebuffer, EnginePalette, Int)?)?
 
+    /// Display style (Crisp / Soft / CRT).  Cached so it survives across
+    /// renderer teardown/recreation; applied to the live renderer on set and
+    /// re-applied whenever `startRendering()` builds a fresh one.
+    public var displayStyle: DisplayStyle = .crisp {
+        didSet { renderer?.displayStyle = displayStyle }
+    }
+
+    /// CRT barrel-curvature toggle (only consulted when `displayStyle == .crt`).
+    public var crtCurvatureEnabled: Bool = false {
+        didSet { renderer?.crtCurvatureEnabled = crtCurvatureEnabled }
+    }
+
     // ---------------------------------------------------------------
     // MARK: Private — Metal state
     // ---------------------------------------------------------------
@@ -158,6 +170,9 @@ public final class JohnnyMetalView: NSView {
             // Renderer setup failure is non-fatal: the view just stays black.
             return
         }
+        // Re-apply cached display configuration to the fresh renderer.
+        renderer?.displayStyle        = displayStyle
+        renderer?.crtCurvatureEnabled = crtCurvatureEnabled
 
         lastTickTime = CACurrentMediaTime()
 

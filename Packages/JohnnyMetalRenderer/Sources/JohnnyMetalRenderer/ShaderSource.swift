@@ -18,12 +18,20 @@
 // the same shaders. Compilation takes ~10–20 ms at init time — acceptable for
 // a screensaver.
 //
-// Pipeline overview:
-//   Vertex: fullscreen triangle strip (4 vertices, no vertex buffer),
-//           clipped to the integer-scaled game rect via uniform gameRect.
-//   Fragment: R8Uint framebuffer index → 16×1 RGBA palette LUT → output colour.
+// Two-pass pipeline (see EngineRenderer.swift):
+//   Pass 1 — resolve:  vertexShader (full-screen) + fragmentShader.
+//                      R8Uint framebuffer index → 16×1 RGBA palette LUT →
+//                      offscreen rgba8Unorm 640×480 "resolved" texture.
+//   Pass 2 — display style:  vertexShader (letterboxed game rect) + one of
+//                      blitFragment (Crisp/Soft) or crtFragment (CRT), sampling
+//                      the resolved texture through a nearest/linear sampler.
 //
-// Shader design notes:
+// Splitting into two passes is what makes Soft (bilinear) and CRT possible:
+// you cannot meaningfully filter an *integer* palette-index texture, so pass 1
+// expands indices to real colours first, and pass 2 filters/post-processes the
+// resulting RGBA image.
+//
+// Resolve-pass design notes:
 //   - Palette indices 0–15 map to RGBA8 entries in the 16×1 palette texture.
 //   - Index 0xFF (transparency sentinel, see Framebuffer.swift) is mapped to
 //     black (0,0,0,1). By the time the composed framebuffer reaches the
@@ -110,5 +118,76 @@ fragment float4 fragmentShader(
     }
 
     return palette.read(uint2(idx, 0u));
+}
+
+// -----------------------------------------------------------------------
+// Pass 2 — display-style fragments (sample the resolved RGBA texture)
+// -----------------------------------------------------------------------
+
+/// Crisp / Soft: straight texture lookup.  The bound sampler decides the
+/// look — nearest = Crisp (sharp integer-ish pixels), linear = Soft (bilinear).
+fragment float4 blitFragment(
+    VertexOut in [[stage_in]],
+    texture2d<float, access::sample> resolved [[texture(0)]],
+    sampler                          samp     [[sampler(0)]]
+) {
+    return resolved.sample(samp, in.texCoord);
+}
+
+// CRT post-process tuning constants ("Moderate retro").  Scanline gaps and the
+// shadow mask are tied to the 640×480 source grid (not the device resolution)
+// so the look is the same on every monitor and reads as a low-res CRT.
+constant float CRT_PI            = 3.14159265359;
+constant float CRT_SCAN_DEPTH    = 0.18;   // how dark the gaps between rows get
+constant float CRT_MASK_DEPTH    = 0.12;   // aperture-grille tint strength
+constant float CRT_VIGNETTE      = 0.25;   // edge darkening
+constant float CRT_CURVE_AMOUNT  = 0.045;  // barrel-distortion strength (toggle)
+constant float CRT_BRIGHTEN      = 1.08;   // compensate for the darkening above
+
+struct CRTParams {
+    uint curvatureEnabled;
+};
+
+/// Barrel-distort UVs about the centre to mimic a curved tube.
+static float2 crtCurve(float2 uv) {
+    float2 cc = uv - 0.5;
+    float  r2 = dot(cc, cc);
+    return 0.5 + cc * (1.0 + r2 * CRT_CURVE_AMOUNT * 4.0);
+}
+
+fragment float4 crtFragment(
+    VertexOut in [[stage_in]],
+    texture2d<float, access::sample> resolved [[texture(0)]],
+    sampler                          samp     [[sampler(0)]],
+    constant CRTParams              &params   [[buffer(0)]]
+) {
+    float2 uv = in.texCoord;
+
+    if (params.curvatureEnabled != 0u) {
+        uv = crtCurve(uv);
+        // Outside the warped image → black bezel (gives the rounded corners).
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            return float4(0.0, 0.0, 0.0, 1.0);
+        }
+    }
+
+    float3 color = resolved.sample(samp, uv).rgb;
+
+    // Scanlines: one soft dark gap per source row (480 rows).
+    float scan = sin(uv.y * 480.0 * CRT_PI);
+    color *= 1.0 - CRT_SCAN_DEPTH * scan * scan;
+
+    // Aperture mask: cycle an R/G/B tint across source columns (640 cols).
+    uint  col  = uint(uv.x * 640.0) % 3u;
+    float3 mask = float3(1.0 - CRT_MASK_DEPTH);
+    mask[col] = 1.0;
+    color *= mask;
+
+    // Mild vignette toward the edges.
+    float2 vc  = uv - 0.5;
+    color *= 1.0 - dot(vc, vc) * CRT_VIGNETTE;
+
+    color *= CRT_BRIGHTEN;
+    return float4(clamp(color, 0.0, 1.0), 1.0);
 }
 """

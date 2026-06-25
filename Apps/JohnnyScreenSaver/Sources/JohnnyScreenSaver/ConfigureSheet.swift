@@ -16,13 +16,16 @@
 // Options…" in System Settings. Programmatic AppKit — no XIBs, no
 // SwiftUI — so it works reliably inside .saver bundles.
 //
-// Phase 6 controls (plan §2.4):
+// Controls (plan §2.4 + Phase 7 display style):
 //   • Resource folder picker  (required to run)
 //   • Sound on/off
 //   • Animation speed         (0.5× / 1× / 1.5× / 2×)
 //   • Story day               (Auto / 1–30)
 //   • Force holiday           (Off / Halloween / St Patrick / Christmas / NY)
+//   • Display style           (Crisp / Soft / CRT)            [Phase 7]
+//   • CRT screen curvature    (Off / On — enabled only for CRT) [Phase 7]
 //   • Show debug overlay      (Off / On)
+//   • Restart story button    (resets the 11-day arc to day 1) [Phase 7]
 //
 // Note: a security-scoped bookmark is created by save() ONLY when running
 // inside legacyScreenSaver — see ResourceFolder.swift.  In this sheet
@@ -46,6 +49,8 @@ final class ConfigureSheetController: NSObject {
     private var speedPopup:     NSPopUpButton!
     private var dayPopup:       NSPopUpButton!
     private var holidayPopup:   NSPopUpButton!
+    private var displayPopup:   NSPopUpButton!
+    private var curvatureCheckbox: NSButton!
     private var debugCheckbox:  NSButton!
 
     // Layout constants — single source of truth so we can adjust the
@@ -62,7 +67,7 @@ final class ConfigureSheetController: NSObject {
     // ---------------------------------------------------------------
 
     private func makeWindow() -> NSWindow {
-        let H: CGFloat = 468   // one row shorter since the fidelity popup was removed
+        let H: CGFloat = 564   // +96 for the Phase 7 "Display" section (label + popup + curvature)
         let win = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: H),
             styleMask: [.titled],
@@ -162,6 +167,34 @@ final class ConfigureSheetController: NSObject {
         y -= sectionGap
         addSeparator(to: content, y: y)
 
+        // ---- Display section ------------------------------------------
+
+        y -= 24
+        addBoldLabel("Display", to: content, x: leftMargin, y: y, w: 440)
+
+        y -= rowHeight
+        displayPopup = makePopup(
+            target: #selector(displayChanged),
+            items: ["Crisp (sharp pixels)", "Soft (smoothed)", "CRT (retro)"],
+            tags:  [0, 1, 2]
+        )
+        displayPopup.selectItem(withTag: ResourceFolder.displayStyle)
+        addRow(label: "Style:", control: displayPopup, to: content, y: y)
+
+        y -= 26
+        curvatureCheckbox = NSButton(
+            checkboxWithTitle: "CRT screen curvature",
+            target: self,
+            action: #selector(curvatureToggled)
+        )
+        curvatureCheckbox.frame = NSRect(x: controlX, y: y, width: 300, height: 22)
+        curvatureCheckbox.state = ResourceFolder.crtCurvatureEnabled ? .on : .off
+        content.addSubview(curvatureCheckbox)
+        updateCurvatureEnabledState()
+
+        y -= sectionGap
+        addSeparator(to: content, y: y)
+
         // ---- Debug section --------------------------------------------
 
         y -= 26
@@ -184,6 +217,15 @@ final class ConfigureSheetController: NSObject {
         choose.bezelStyle = .rounded
         choose.frame = NSRect(x: leftMargin, y: 12, width: 140, height: 32)
         content.addSubview(choose)
+
+        let restart = NSButton(
+            title: "Restart Story…",
+            target: self,
+            action: #selector(restartStoryClicked)
+        )
+        restart.bezelStyle = .rounded
+        restart.frame = NSRect(x: 170, y: 12, width: 140, height: 32)
+        content.addSubview(restart)
 
         let done = NSButton(
             title: "Done",
@@ -267,7 +309,16 @@ final class ConfigureSheetController: NSObject {
         speedPopup.selectItem(withTag: speedTag(for: ResourceFolder.animationSpeed))
         dayPopup.selectItem(withTag: ResourceFolder.forceStoryDay)
         holidayPopup.selectItem(withTag: ResourceFolder.forceHoliday)
+        displayPopup.selectItem(withTag: ResourceFolder.displayStyle)
+        curvatureCheckbox.state = ResourceFolder.crtCurvatureEnabled ? .on : .off
+        updateCurvatureEnabledState()
         debugCheckbox.state  = ResourceFolder.debugOverlayEnabled ? .on : .off
+    }
+
+    /// The curvature toggle only applies to CRT mode; grey it out otherwise so
+    /// it's clear the option is CRT-specific.
+    private func updateCurvatureEnabledState() {
+        curvatureCheckbox.isEnabled = (displayPopup.selectedTag() == 2)   // 2 = CRT
     }
 
     // ---------------------------------------------------------------
@@ -314,6 +365,30 @@ final class ConfigureSheetController: NSObject {
 
     @objc private func holidayChanged() {
         ResourceFolder.forceHoliday = holidayPopup.selectedTag()
+    }
+
+    @objc private func displayChanged() {
+        ResourceFolder.displayStyle = displayPopup.selectedTag()
+        updateCurvatureEnabledState()
+    }
+
+    @objc private func curvatureToggled() {
+        ResourceFolder.crtCurvatureEnabled = (curvatureCheckbox.state == .on)
+    }
+
+    @objc private func restartStoryClicked() {
+        let alert = NSAlert()
+        alert.messageText     = "Restart the story from day 1?"
+        alert.informativeText = "Johnny's 11-day arc will begin again. This takes "
+                              + "effect the next time the screensaver activates."
+        alert.alertStyle      = .warning
+        alert.addButton(withTitle: "Restart Story")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { resp in
+            if resp == .alertFirstButtonReturn {
+                ResourceFolder.resetStoryProgress()
+            }
+        }
     }
 
     @objc private func doneClicked() {

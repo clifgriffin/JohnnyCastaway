@@ -46,6 +46,34 @@ struct JohnnyMetalRendererModuleTests {
     }
 }
 
+// MARK: - DisplayStyle (no GPU required)
+
+@Suite("DisplayStyle")
+struct DisplayStyleTests {
+
+    @Test("Raw values are stable (persisted in ScreenSaverDefaults)")
+    func rawValues() {
+        #expect(DisplayStyle.crisp.rawValue == 0)
+        #expect(DisplayStyle.soft.rawValue  == 1)
+        #expect(DisplayStyle.crt.rawValue   == 2)
+    }
+
+    @Test("init(rawValue:) maps known values and rejects unknown ones")
+    func initFromRawValue() {
+        #expect(DisplayStyle(rawValue: 0) == .crisp)
+        #expect(DisplayStyle(rawValue: 1) == .soft)
+        #expect(DisplayStyle(rawValue: 2) == .crt)
+        // Out-of-range → nil; callers fall back to .crisp.
+        #expect(DisplayStyle(rawValue: 3) == nil)
+        #expect(DisplayStyle(rawValue: -1) == nil)
+    }
+
+    @Test("All three styles are enumerated")
+    func allCases() {
+        #expect(DisplayStyle.allCases == [.crisp, .soft, .crt])
+    }
+}
+
 // MARK: - gameRect letterboxing (no GPU required)
 
 infix operator ≈ : ComparisonPrecedence
@@ -294,6 +322,38 @@ struct EngineRendererGPUTests {
         renderer.update(framebuffer: Framebuffer(), palette: .black)
         if let drawable = layer.nextDrawable() {
             renderer.render(to: drawable, drawableSize: layer.drawableSize)
+        }
+        #expect(true)
+    }
+
+    @Test("Every DisplayStyle (and CRT curvature) renders without crashing")
+    func renderEachDisplayStyle() throws {
+        guard let dev = device() else { return }
+        let renderer = try EngineRenderer(device: dev)
+
+        let layer = CAMetalLayer()
+        layer.device          = dev
+        layer.pixelFormat     = .bgra8Unorm
+        layer.drawableSize    = CGSize(width: 1280, height: 960)
+        layer.framebufferOnly = false
+
+        // A non-trivial frame so each pass-2 shader actually samples colour.
+        var fb = Framebuffer()
+        for i in fb.pixels.indices { fb.pixels[i] = UInt8(i % 16) }
+        let palette = EnginePalette(colors: (0..<16).map { i in
+            let v = UInt8(i * 17)
+            return EnginePalette.RGBA(r: v, g: v, b: v)
+        })
+        renderer.update(framebuffer: fb, palette: palette)
+
+        for style in DisplayStyle.allCases {
+            renderer.displayStyle = style
+            for curvature in [false, true] {
+                renderer.crtCurvatureEnabled = curvature
+                if let drawable = layer.nextDrawable() {
+                    renderer.render(to: drawable, drawableSize: layer.drawableSize)
+                }
+            }
         }
         #expect(true)
     }
