@@ -23,12 +23,11 @@ showing it's a genuine `.saver` bundle.*
 
 ## Status
 
-**v1.3** — feature-complete and stable. Tested on macOS 26 Tahoe,
-Apple Silicon. Runs unattended for hours. The multi-day story arc
-has been observed advancing naturally across real calendar days
-(raft growth, visitor scenes, holiday triggers); end-to-end
-verification of all eleven days and the cycle wrap to day 1 is
-ongoing as wall-clock days elapse.
+**v1.4** — feature-complete and stable. Tested on macOS 26 Tahoe,
+Apple Silicon. This build has run unattended for several weeks with
+no observed issues; the multi-day story arc advances naturally
+across real calendar days (raft growth, visitor scenes, holiday
+triggers) and persists durably across restarts.
 
 Highlights:
 
@@ -39,9 +38,44 @@ Highlights:
 - Walk-graph A* pathfinder
 - 11-day story arc persisted across screensaver activations (v1.1)
 - INTRO.SCR title screen with cycling wipe transitions on startup (v1.2)
+- Display-style shader: Crisp, Soft, or CRT (scanlines, aperture-mask
+  tint, vignette, optional barrel curvature) (v1.4)
 - Configure sheet with animation speed, force-day, force-holiday,
-  fidelity-mode, and debug overlay
-- 104 engine unit tests, 11 renderer tests
+  display style, Restart Story, and debug overlay
+- 104 engine unit tests, 23 renderer tests
+
+v1.4 changes:
+
+- **Display styles + Restart Story** — new Display section in the
+  configure sheet: Crisp (nearest-neighbour), Soft (linear filtering),
+  or CRT (scanlines, aperture-mask tint, vignette, optional barrel
+  curvature), applied live. A Restart Story button resets the story
+  arc to day 1 (takes effect on next activation).
+- **Settings intermittently reverting** — the saver wrote its ByHost
+  plist directly behind cfprefsd's back; the daemon never re-reads
+  external edits and eventually clobbered them. All persistence now
+  goes through `ScreenSaverDefaults`/cfprefsd, with one settings
+  bridge per process and a single elected writer for story progress.
+  Fixed.
+- **Story day resetting** — settings (including story day) were never
+  actually committed to cfprefsd, so each launch read a stale day.
+  `flushPreferences` now calls `synchronize()` on the
+  `ScreenSaverDefaults` object itself — the documented commit path —
+  and story progress is additionally persisted at lifecycle teardown.
+  Verified durable across a `kill -9`. Fixed.
+- **CPU burn from piled-up saver instances** — on Tahoe,
+  WallpaperAgent-hosted saver views animate from process spawn and are
+  never stopped, so leaked instances ran engine + Metal at up to
+  100 fps forever (38 views / 13–21% CPU observed). Work is now gated
+  on kernel HID idle time, rendering only happens when the engine
+  produces a new frame, and a stale-view reaper drops leaked siblings.
+  Steady state while working: ~0.3% CPU. Fixed.
+- **Engine fidelity hardcoded to Fixed** — the Raw (jc_reborn) vs
+  Fixed (Go corrections) toggle was an A/B-verification aid production
+  never needed; the corrected behaviour is now always on and the
+  setting is gone.
+- **Licence** — relicensed from MIT to GPLv3-or-later (the engine is a
+  derivative work of the GPL-licensed jc_reborn).
 
 v1.3 fixes:
 
