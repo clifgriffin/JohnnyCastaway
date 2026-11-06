@@ -13,9 +13,8 @@
 // JohnnyScreenSaverView.swift
 //
 // The ScreenSaverView subclass loaded by macOS's legacyScreenSaver
-// host process. Each connected display gets its own instance with its
-// own engine + renderer; we deliberately do NOT share state across
-// instances so multi-display works without cross-screen sync.
+// host process. Each display has its own renderer. One view runs the
+// story and shares its frames with all other views, also across processes.
 //
 // Lifecycle (Sonoma-aware):
 //   • init(frame:isPreview:) — set up CAMetalLayer backing, defaults
@@ -51,11 +50,13 @@ private let _bundleLoadMarker: Void = {
 public final class JohnnyScreenSaverView: ScreenSaverView {
 
     // ---------------------------------------------------------------
-    // MARK: Engine state (per-instance — never shared across displays)
+    // MARK: Engine and shared frames
     // ---------------------------------------------------------------
 
     private var renderer:    EngineRenderer?
     private var storyRunner: StoryRunner?
+    private var sharedFrames: SharedStoryFrames?
+    private var resourceFolder: URL?
     private var rng          = SystemRandomNumberGenerator()
     private var soundSink: SoundSink = NullSoundSink()
 
@@ -79,14 +80,6 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     /// Animation-speed multiplier captured at startup (settings sheet).
     /// 1.0 = faithful pacing; 2.0 doubles speed; 0.5 halves it.
     private var animationSpeed: Double = 1.0
-
-    /// Whether THIS instance persists story progress.  On multi-display
-    /// setups every display runs its own StoryRunner; if they all wrote
-    /// ProgressStoryDay the persisted day would be last-writer-wins and
-    /// could regress.  Only the main-display instance writes (same gate as
-    /// audio); the nil-main fallback keeps single-instance/test contexts
-    /// persisting.  Set during startupIfNeeded.
-    private var persistsStoryProgress = false
 
     // ---- Debug overlay (only created when ResourceFolder.debugOverlayEnabled) ----
 
@@ -436,7 +429,11 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             }
         }
 
-        startupIfNeeded()
+        if case .error = loadState {
+            resetAndStartup()
+        } else {
+            startupIfNeeded()
+        }
         framePending = true
         stallMonitor.start()
 
@@ -510,10 +507,8 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         soundSink.stopAll()
         NSLog("[Johnny] stopAnimation: audio silenced")
 
-        // Commit the latest story day to cfprefsd while the engine is still
-        // alive (stopAnimation does not tear it down).  No-ops when nothing
-        // changed; the engine survives, so this is cheap.
-        persistStoryProgressNow()
+        // Save progress and permit another display to run the story.
+        releaseSharedStory()
 
         // Arm the runaway-host watchdog (gated by process name and
         // full-screen mode — see scheduleEmergencyExitIfNeeded).
@@ -550,6 +545,9 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             NSLog("[Johnny] startupIfNeeded: already running, skipping")
             return
         }
+        hasRenderedOnce = false
+        gateQuiesced = false
+        animationTimeInterval = 1.0 / 100.0
 
         // Drop the in-process preferences cache before reading any settings,
         // so values written by another saver instance (or persisted by the
@@ -590,27 +588,37 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             return
         }
 
+        resourceFolder = folder
+        do {
+            sharedFrames = try SharedStoryFrames(folder: folder)
+        } catch {
+            loadState = .error("Cannot share the story: \(error.localizedDescription)")
+            return
+        }
+        loadState = .loaded
+        animationSpeed = ResourceFolder.animationSpeed
+        if sharedFrames?.claimProducer() == true {
+            startStory(folder: folder)
+        }
+    }
+
+    /// The producer owns the engine, sound, and saved story progress.
+    private func startStory(folder: URL) {
+        ResourceFolder.flushPreferences()
+
         // Point the stall monitor's file sink at the (sandbox-writable)
         // resource folder so a wedge that happens hours from now leaves a
         // persistent record next to the data files, retrievable after the fact.
         stallMonitor.configure(
             logFileURL: folder.appendingPathComponent("JohnnyCastaway-stall.log"))
 
-        // 3. Sound sink — create before the StoryRunner so the sink's
-        //    AVAudioPlayers are preloaded from the same folder.
-        //    On multi-monitor setups macOS starts one legacyScreenSaver per
-        //    display.  Restrict audio to the main display only; all others use
-        //    a silent sink so we don't get a cacophony of simultaneous audio.
-        let isMainDisplay = window?.screen == NSScreen.main || NSScreen.main == nil
-        // Same gate elects the single story-progress writer for this session.
-        persistsStoryProgress = isMainDisplay
-        if ResourceFolder.soundEnabled && isMainDisplay {
+        // Only the producer can play sound or save progress.
+        if ResourceFolder.soundEnabled {
             soundSink = AVAudioPlayerSoundSink(folder: folder)
             NSLog("[Johnny] startupIfNeeded: sound ON")
         } else {
             soundSink = NullSoundSink()
-            NSLog("[Johnny] startupIfNeeded: sound OFF%@",
-                  ResourceFolder.soundEnabled ? " (secondary display — muted)" : "")
+            NSLog("[Johnny] startupIfNeeded: sound OFF")
         }
 
         // 4. Parse archive + spin up StoryRunner
@@ -668,6 +676,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             self.storyRunner  = runner
             self.loadState    = .loaded
             self.lastTickWall = CACurrentMediaTime()
+            self.lastMiniMS   = 4
 
             // Install the debug HUD if enabled.
             if ResourceFolder.debugOverlayEnabled {
@@ -678,6 +687,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         } catch {
             NSLog("[Johnny] startupIfNeeded: archive/engine error — %@", error.localizedDescription)
             loadState = .error("Resources: \(error.localizedDescription)")
+            releaseSharedStory()
         }
     }
 
@@ -839,6 +849,9 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     /// Used after the user configures the resource folder at runtime.
     private func resetAndStartup() {
         NSLog("[Johnny] resetAndStartup")
+        releaseSharedStory()
+        sharedFrames = nil
+        resourceFolder = nil
         renderer    = nil
         storyRunner = nil
         startupIfNeeded()
@@ -854,7 +867,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     /// or torn down.  Best-effort and idempotent — `saveStoryProgress`
     /// no-ops when nothing changed.  Gated identically to the in-run save:
     /// never persist a forced (diagnostic) day, and only from the elected
-    /// main-display writer so secondary displays can't race the day back.
+    /// producer so other displays cannot change the saved day.
     ///
     /// Note: on Tahoe the wallpaper instance often receives neither
     /// stopAnimation nor viewDidMoveToWindow(nil), so this is a belt-and-
@@ -864,9 +877,17 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     private func persistStoryProgressNow() {
         guard let runner = storyRunner,
               runner.forceStoryDay == nil,
-              persistsStoryProgress else { return }
+              sharedFrames?.isProducer == true else { return }
         ResourceFolder.saveStoryProgress(day: runner.storyDay,
                                          lastCalendarDay: runner.lastCalendarDay)
+    }
+
+    private func releaseSharedStory() {
+        persistStoryProgressNow()
+        soundSink.stopAll()
+        soundSink = NullSoundSink()
+        storyRunner = nil
+        sharedFrames?.releaseProducer()
     }
 
     // ---------------------------------------------------------------
@@ -875,8 +896,10 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
 
     private func teardown() {
         diagLog("teardown")
-        // Commit the latest story day before we drop the engine.
-        persistStoryProgressNow()
+        // Save progress before we release the producer lock.
+        releaseSharedStory()
+        sharedFrames = nil
+        resourceFolder = nil
         // Stop the 100 Hz animation timer for good.  macOS rarely sends
         // stopAnimation itself, so without this every torn-down leaked view
         // keeps firing animateOneFrame forever (measured: 6 dead views ≈ 3%
@@ -902,10 +925,10 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
             metalLayer.device = nil
         }
         renderer    = nil
-        storyRunner = nil
-        soundSink.stopAll()             // halt in-flight audio before releasing
-        soundSink   = NullSoundSink()   // drop AVAudioPlayer instances
-        ResourceFolder.stopAccessing()  // release security-scoped sandbox token
+        // Other views in this process can still need the same access token.
+        if !Self.allInstances.allObjects.contains(where: { $0.renderer != nil }) {
+            ResourceFolder.stopAccessing()
+        }
         removeDebugOverlay()
         // If we never successfully loaded, allow the picker to reappear
         // next time startAnimation fires (e.g. user dismisses screensaver
@@ -920,6 +943,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
     // ---------------------------------------------------------------
 
     public override func animateOneFrame() {
+        guard isAnimating else { return }
         // Diag heartbeat (low rate; file write only when the debug-overlay
         // toggle is on): confirms timer rate (fires ≈ 60×4 quiesced,
         // 60×100 running) and gate state during soak testing.
@@ -962,9 +986,8 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
                !cachedScreenLocked, !cachedSettingsFrontmost {
                 if !gateQuiesced {
                     gateQuiesced = true
-                    // Halt the in-flight sample but keep the players loaded —
-                    // the next session resumes on the same engine and sink.
-                    (soundSink as? AVAudioPlayerSoundSink)?.stopCurrent()
+                    // A visible preview can continue while this view is idle.
+                    releaseSharedStory()
                     // Even an empty animateOneFrame costs real CPU at 100 Hz
                     // (each fire runs inside NSAnimationContext machinery) —
                     // drop to 4 Hz while frozen.  Resume latency is bounded
@@ -986,6 +1009,12 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         guard let metalLayer = layer as? CAMetalLayer,
               let renderer   = renderer else { return }
 
+        if case .loaded = loadState, let frames = sharedFrames {
+            if !frames.isProducer, frames.claimProducer(), let folder = resourceFolder {
+                startStory(folder: folder)
+            }
+        }
+
         // Pace engine ticks against the previous tick's `mini`, scaled by
         // the user's animation-speed multiplier.  Higher multiplier =>
         // shorter wall-clock interval between ticks => faster animation.
@@ -1002,11 +1031,8 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
                         // sheet's force-day override.  Persisting while
                         // forced would let a temporary diagnostic override
                         // (e.g. "preview day 8") leak into the permanent
-                        // natural-progression state.  Also only from the
-                        // elected writer instance (main display) so
-                        // secondary displays' runners don't race the
-                        // persisted day backwards.
-                        if runner.forceStoryDay == nil, persistsStoryProgress {
+                        // natural-progression state. Only the producer saves.
+                        if runner.forceStoryDay == nil, sharedFrames?.isProducer == true {
                             ResourceFolder.saveStoryProgress(
                                 day:             runner.storyDay,
                                 lastCalendarDay: runner.lastCalendarDay
@@ -1030,14 +1056,24 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
                 // fire re-enters the tick path, and renderer.update is never
                 // called — leaving the display permanently black.
                 lastTickWall = now
-                renderer.update(framebuffer: runner.composedFramebuffer,
-                                palette:    runner.palette)
+                let framebuffer = runner.composedFramebuffer
+                do {
+                    try sharedFrames?.publish(framebuffer: framebuffer,
+                                              palette: runner.palette)
+                } catch {
+                    NSLog("[Johnny] frame share error: %@", error.localizedDescription)
+                    loadState = .error("Cannot share the story: \(error.localizedDescription)")
+                    releaseSharedStory()
+                }
                 framePending = true
             }
         }
-        // (If no story runner, the initial framePending=true pushed one
-        // frame at startup and the layer holds it; nothing to animate.)
-
+        // The producer also draws from the shared frame. If a write is busy,
+        // every display keeps the previous frame until the next update.
+        if let frame = sharedFrames?.readLatest() {
+            renderer.update(framebuffer: frame.framebuffer, palette: frame.palette)
+            framePending = true
+        }
         // Render only when the engine actually produced a new frame (or a
         // resize/resume forced one).  animateOneFrame fires at 100 Hz for
         // tick pacing, but encoding + presenting 100 identical frames per
@@ -1140,6 +1176,10 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
         }
         emergencyExitWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
+            // One stopped display must not terminate other active displays.
+            guard !Self.allInstances.allObjects.contains(where: {
+                $0 !== self && $0.isAnimating && $0.renderer != nil
+            }) else { return }
             NSLog("[Johnny] watchdog: forcing exit(0) — host failed to terminate")
             // Best-effort final teardown so any in-flight audio is killed
             // before exit() pulls the rug.
@@ -1259,7 +1299,7 @@ public final class JohnnyScreenSaverView: ScreenSaverView {
 
         let runner    = storyRunner
         let lastSamp  = (soundSink as? AVAudioPlayerSoundSink)?.lastSampleID
-        let day       = runner?.storyDay ?? 0
+        let day       = runner.map { String($0.storyDay) } ?? "shared story"
         let active    = runner?.activeThreadCount ?? 0
         let allocated = runner?.allocatedThreadCount ?? 0
         let opcodes   = runner?.coveredTTMOpcodes.count ?? 0

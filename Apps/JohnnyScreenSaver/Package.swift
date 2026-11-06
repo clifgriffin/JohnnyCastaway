@@ -64,6 +64,10 @@ let package = Package(
                 ]),
             ]
         ),
+        .testTarget(
+            name: "JohnnyScreenSaverTests",
+            dependencies: ["JohnnyScreenSaver"]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

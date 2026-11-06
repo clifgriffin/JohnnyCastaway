@@ -8,8 +8,8 @@ The `.saver` bundle for System Settings → Screen Saver.
 - Builds as a `.saver` bundle (Mach-O `MH_BUNDLE`) via SwiftPM + a
   build script that wraps the dylib with `Info.plist` + `Resources/`.
 - Loads in `legacyScreenSaver` via `NSPrincipalClass = JohnnyScreenSaverView`.
-- `CAMetalLayer`-backed `ScreenSaverView` with per-instance engine +
-  renderer (multi-display safe).
+- Each display has its own Metal renderer. One engine supplies the same
+  story frames to all displays, also across host processes.
 - BYO-resource flow: configure sheet picks a folder via `NSOpenPanel`
   and persists a security-scoped bookmark in
   `ScreenSaverDefaults(forModuleWithName: …)`. Resolved on each saver
@@ -46,6 +46,12 @@ Apps/JohnnyScreenSaver/Scripts/build-saver.sh --install --reload
 Then open System Settings → Screen Saver → "Other" section, find
 "Johnny Castaway", click "Screen Saver Options…" and pick your
 resource folder.
+
+The resource folder must permit file writes. The saver uses two hidden
+files, `.johnny-story.lock` and `.johnny-story.frame`, to share frames.
+One view holds the producer lock and runs the engine, sound, and saved
+progress. Other views read its frames. When that view stops, another
+view can take control. Do not delete these files while the saver runs.
 
 ## Architecture
 

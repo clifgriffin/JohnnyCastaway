@@ -577,6 +577,9 @@ enum ResourceFolder {
         sharedDefaults.set(day,             forKey: progressDayKey)
         sharedDefaults.set(lastCalendarDay, forKey: progressCalDayKey)
         flushPreferences()
+        // A new producer can run in another host container.
+        bridgeToPeerProcesses(key: progressDayKey, value: day)
+        bridgeToPeerProcesses(key: progressCalDayKey, value: lastCalendarDay)
     }
 
     /// Reset the persisted story arc by removing the keys locally.  Works only

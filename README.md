@@ -42,6 +42,7 @@ Highlights:
   tint, vignette, optional barrel curvature) (v1.4)
 - Configure sheet with animation speed, force-day, force-holiday,
   display style, Restart Story, and debug overlay
+- One story shared across all displays, with one sound source
 - 104 engine unit tests, 23 renderer tests
 
 v1.4 changes:
@@ -217,6 +218,9 @@ extracted by the JCOS project and made available at
 This repository contains no Sierra data files, takes no position on
 where users obtain them, and provides no copies. The data files
 remain Sierra/Dynamix intellectual property.
+
+The resource folder must permit file writes. The saver uses two hidden
+files in that folder to share the same frames across all displays.
 
 ---
 
